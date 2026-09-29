@@ -4,7 +4,7 @@ name: ci
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, labeled, unlabeled]
+    types: [opened, edited, synchronize, reopened, labeled, unlabeled]
 
 permissions:
   actions: read

@@ -39,7 +39,7 @@ No `infra`, também `infra / tofu` e `infra / kubeconform`.
 
 ### Portão de aprovação humana
 
-O `human-gate` falha quando o pull request mexe num caminho protegido, a menos que tenha a label `human-approved` colocada por uma pessoa. Label colocada por um bot (GitHub App dos agentes) não vale. O check roda de novo quando labels são colocadas ou tiradas, então basta colocar a label para liberar o merge. A label só vale se foi colocada depois do último push: commits novos (ou um force push) invalidam a aprovação, e o portão pede para tirar e colocar a label de novo depois de revisar. O momento do push é o mais recente entre a primeira execução de workflow do commit do head **neste PR** (evento `pull_request`, mesma branch e ligada a este PR, criada pelo próprio push) e o último force push. Execuções do mesmo commit em outra branch ou outro PR não contam, para que um fast-forward para um commit antigo não herde a aprovação. Sem execução correspondente, o portão falha. A data do commit não é usada, porque quem faz o commit escolhe a data.
+O `human-gate` falha quando o pull request mexe num caminho protegido, a menos que tenha a label `human-approved` colocada por uma pessoa. Label colocada por um bot (GitHub App dos agentes) não vale. O check roda de novo quando labels são colocadas ou tiradas, então basta colocar a label para liberar o merge. A label só vale se foi colocada depois da última mudança do PR: push de commits novos, force push, volta a um commit anterior ou troca da base. Depois disso, o portão pede para tirar e colocar a label de novo. A última mudança do head é a primeira execução de workflow do SHA atual **neste PR** (evento `pull_request`, mesma branch, ligada a este PR) que vem depois da última execução de qualquer outro SHA. Assim um commit que volta a ser o head, por exemplo por fast-forward, não herda uma aprovação antiga. Force push e troca de base contam pelos eventos `head_ref_force_pushed` e `base_ref_changed` do PR. A data do commit não é usada, porque quem faz o commit escolhe a data. Na dúvida (nenhuma execução correspondente), o portão falha. Os arquivos são sempre comparados com a base atual do PR.
 
 Se a API do GitHub falhar, o portão falha; ele nunca passa por padrão. Também falha se o PR mexe em 3000 arquivos ou mais (o limite da API que lista os arquivos): nesse caso, divida o PR.
 
@@ -66,7 +66,7 @@ name: ci
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, labeled, unlabeled]
+    types: [opened, edited, synchronize, reopened, labeled, unlabeled]
 
 permissions:
   actions: read
@@ -94,7 +94,7 @@ name: ci
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, labeled, unlabeled]
+    types: [opened, edited, synchronize, reopened, labeled, unlabeled]
 
 permissions:
   actions: read
@@ -141,7 +141,12 @@ A regra de ruleset "Require workflows to pass before merging", que resolveria is
 - **GitHub App dos agentes sem a permissão "Workflows":** o GitHub recusa push de App sem essa permissão que mexa em `.github/workflows/`, em qualquer repositório, inclusive neste, que é público.
 - **Push ruleset "Restrict file paths" em `.github/workflows/**`** nos repositórios privados, com bypass só para o Denilson.
 
-Um caller sem `labeled` e `unlabeled` em `types` nunca libera um PR protegido: colocar a label não roda o portão de novo, e o check continua falhando até outro push, que por sua vez invalida a label. Use sempre o caller documentado abaixo.
+O caller precisa ter em `types` exatamente `opened, edited, synchronize, reopened, labeled, unlabeled`:
+
+- Sem `labeled` e `unlabeled`, o caller nunca libera um PR protegido: colocar a label não roda o portão de novo, e o check continua falhando até outro push, que por sua vez invalida a label.
+- Sem `edited`, trocar a base do PR não roda os checks de novo, e o resultado verde do mesmo SHA passa a valer para a base nova.
+
+Até existir o GitHub App dos agentes, também ficam como limite conhecido os contornos que dependem do token do Denilson (que os agentes usam hoje) ou de editar o caller: com esse token, um agente consegue colocar a label como "usuário" ou mudar o `ci.yml`. A proteção, nesse caso, é a revisão do Denilson.
 
 ### Segurança e custo
 

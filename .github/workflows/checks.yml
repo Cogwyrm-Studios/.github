@@ -250,35 +250,42 @@ jobs:
             fail "The '$APPROVAL_LABEL' label was applied by a ${labeler_type:-unknown actor}, not by a human. Remove it and let a person apply it."
           fi
 
-          # When the current head arrived in THIS pull request: the first
-          # pull_request run for its SHA on this head branch and linked to
-          # this pull request (the run is created by the push), or the last
-          # force push, whichever is newer. Runs of the same commit on other
-          # branches or pull requests do not count. Commit dates are not
-          # used; they come from the author. No matching run: fail closed.
+          # When the head of THIS pull request last changed. Only
+          # pull_request runs on this head branch, linked to this pull
+          # request, count (a run is created by each push). The push time is
+          # the first run of the current SHA after the last run of any other
+          # SHA, so a commit that becomes the head again (for example by a
+          # fast-forward) does not inherit an older approval. A force push
+          # or a base change, when newer, counts as the last change too.
+          # Commit dates are not used; they come from the author. Anything
+          # ambiguous fails closed.
           head_sha="$(jq -r '.head.sha' "$work/pr.json")"
           head_ref="$(jq -r '.head.ref' "$work/pr.json")"
-          gh api --paginate "repos/$REPO/actions/runs?event=pull_request&head_sha=$head_sha&per_page=100" \
+          branch_query="$(jq -rn --arg ref "$head_ref" '$ref | @uri')"
+          gh api --paginate "repos/$REPO/actions/runs?event=pull_request&branch=$branch_query&per_page=100" \
             --jq '.workflow_runs[] | @json' > "$work/runs.jsonl" \
-            || fail "Could not read the workflow runs of the head commit."
-          first_run_at="$(jq -r --arg sha "$head_sha" --arg ref "$head_ref" --arg repo "$REPO" \
-            --argjson pr "$PR_NUMBER" \
-            'select(.event == "pull_request" and .head_sha == $sha and .head_branch == $ref
+            || fail "Could not read the workflow runs of the pull request."
+          jq -r --arg ref "$head_ref" --arg repo "$REPO" --argjson pr "$PR_NUMBER" \
+            'select(.event == "pull_request" and .head_branch == $ref
               and .head_repository.full_name == $repo
-              and any(.pull_requests[]?; .number == $pr)) | .created_at' \
-            "$work/runs.jsonl" | sort | head -n 1)"
-          force_pushed_at="$(jq -r 'select(.event == "head_ref_force_pushed") | .created_at' \
-            "$work/events.jsonl" | sort | tail -n 1)"
-          if [ -z "$first_run_at" ]; then
+              and any(.pull_requests[]?; .number == $pr))
+             | "\(.created_at) \(.head_sha)"' \
+            "$work/runs.jsonl" | sort > "$work/pr-runs.txt"
+          last_other_at="$(awk -v sha="$head_sha" '$2 != sha { t = $1 } END { print t }' "$work/pr-runs.txt")"
+          head_run_at="$(awk -v sha="$head_sha" -v after="$last_other_at" \
+            '$2 == sha && $1 > after { print $1; exit }' "$work/pr-runs.txt")"
+          if [ -z "$head_run_at" ]; then
             fail "Could not find when the head commit $head_sha was pushed to this pull request."
           fi
-          pushed_at="$(printf '%s\n' "$first_run_at" "$force_pushed_at" | sort | tail -n 1)"
+          other_changes_at="$(jq -r 'select(.event == "head_ref_force_pushed" or .event == "base_ref_changed") | .created_at' \
+            "$work/events.jsonl" | sort | tail -n 1)"
+          pushed_at="$(printf '%s\n' "$head_run_at" "$other_changes_at" | sort | tail -n 1)"
 
           # Timestamps are ISO 8601 in UTC, so text order is time order.
           if [[ ! "$labeled_at" > "$pushed_at" ]]; then
-            fail "The '$APPROVAL_LABEL' label ($labeled_at) is older than the last push ($pushed_at). Remove it and apply it again after reviewing the new commits."
+            fail "The '$APPROVAL_LABEL' label ($labeled_at) is older than the last change of the head or base ($pushed_at). Remove it and apply it again after reviewing the pull request."
           fi
-          echo "Approved: '$APPROVAL_LABEL' applied by a human at $labeled_at, after the last push at $pushed_at."
+          echo "Approved: '$APPROVAL_LABEL' applied by a human at $labeled_at, after the last change of the head or base at $pushed_at."
 
   rust:
     runs-on: ubuntu-24.04
