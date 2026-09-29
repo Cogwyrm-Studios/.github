@@ -7,6 +7,7 @@ on:
     types: [opened, synchronize, reopened, labeled, unlabeled]
 
 permissions:
+  actions: read
   contents: read
   pull-requests: read
 

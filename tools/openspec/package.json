@@ -1,0 +1,8 @@
+{
+  "name": "cogwyrm-ci-openspec",
+  "private": true,
+  "description": "Pinned OpenSpec CLI for the reusable CI workflow (checks.yml).",
+  "dependencies": {
+    "@fission-ai/openspec": "1.13.2"
+  }
+}

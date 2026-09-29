@@ -77,10 +77,29 @@ jobs:
             echo "::notice::No openspec/ directory; nothing to validate."
           fi
 
+      # The OpenSpec CLI and all its dependencies are pinned by the lockfile
+      # in tools/openspec/ of this repository. Callers use @main, so main is
+      # fetched; a pull request here uses its own version.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.detect.outputs.present == 'true'
+        with:
+          repository: Cogwyrm-Studios/.github
+          ref: ${{ github.repository == 'Cogwyrm-Studios/.github' && github.event.pull_request.head.sha || 'main' }}
+          path: .cogwyrm-ci
+          sparse-checkout: tools/openspec
+          persist-credentials: false
+
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         if: steps.detect.outputs.present == 'true'
         with:
           node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install OpenSpec
+        if: steps.detect.outputs.present == 'true'
+        working-directory: .cogwyrm-ci/tools/openspec
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          test "$(node -p 'require("./node_modules/@fission-ai/openspec/package.json").version')" = "$OPENSPEC_VERSION"
 
       - name: Validate changes and specs
         if: steps.detect.outputs.present == 'true'
@@ -88,12 +107,13 @@ jobs:
           OPENSPEC_TELEMETRY: "0"
           DO_NOT_TRACK: "1"
           OPENSPEC_NO_UPDATE_CHECK: "1"
-        run: npx --yes "@fission-ai/openspec@${OPENSPEC_VERSION}" validate --all --strict --no-interactive
+        run: .cogwyrm-ci/tools/openspec/node_modules/.bin/openspec validate --all --strict --no-interactive
 
   human-gate:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
+      actions: read
       contents: read
       pull-requests: read
     steps:
@@ -112,11 +132,22 @@ jobs:
           set -euo pipefail
           shopt -s nocasematch
 
+          fail() {
+            echo "::error::$1"
+            exit 1
+          }
+
           patterns=(
-            # Lockfiles: new or updated dependencies.
+            # Lockfiles and dependency manifests: new or updated dependencies.
             Cargo.lock package-lock.json npm-shrinkwrap.json pnpm-lock.yaml
             yarn.lock bun.lock bun.lockb .terraform.lock.hcl go.sum
             poetry.lock uv.lock Pipfile.lock Gemfile.lock composer.lock flake.lock
+            Cargo.toml package.json pyproject.toml 'requirements*.txt'
+            'constraints*.txt' Pipfile setup.py setup.cfg go.mod Gemfile
+            composer.json flake.nix rust-toolchain rust-toolchain.toml
+            .npmrc .yarnrc .yarnrc.yml .tool-versions '.cargo/*' '*/.cargo/*'
+            # CI, repository automation and secret scanning rules.
+            '.github/*' .gitleaks.toml .gitleaksignore
             # Secret encryption rules.
             .sops.yaml
             # Authentication.
@@ -135,25 +166,57 @@ jobs:
             if [ -n "$line" ]; then patterns+=("$line"); fi
           done <<< "$EXTRA_PATTERNS"
 
-          # Renames also count their old path.
-          mapfile -t files < <(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/files" \
-            --jq '.[] | .filename, (.previous_filename // empty)')
+          # Any API failure fails the gate; it never passes by default.
+          work="$RUNNER_TEMP/human-gate"
+          mkdir -p "$work"
+          gh api "repos/$REPO/pulls/$PR_NUMBER" > "$work/pr.json" \
+            || fail "Could not read the pull request."
+          changed_files="$(jq -r '.changed_files' "$work/pr.json")"
+          # The files API lists at most 3000 files.
+          if [ "$changed_files" -ge 3000 ]; then
+            fail "The pull request changes $changed_files files; the gate cannot list them all. Split it."
+          fi
+          gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/files?per_page=100" \
+            --jq '.[] | @json' > "$work/files.jsonl" \
+            || fail "Could not list the files of the pull request."
+          listed="$(wc -l < "$work/files.jsonl")"
+          if [ "$listed" -ne "$changed_files" ]; then
+            fail "Listed $listed files, but the pull request changes $changed_files."
+          fi
 
           matches=()
-          for file in "${files[@]}"; do
-            for pattern in "${patterns[@]}"; do
-              if [[ "$pattern" == */* ]]; then
-                subject="$file"
-              else
-                subject="${file##*/}"
-              fi
-              # shellcheck disable=SC2053 # pattern match on purpose
-              if [[ "$subject" == $pattern ]]; then
-                matches+=("$file (matches '$pattern')")
-                break
-              fi
+          while IFS= read -r entry; do
+            file="$(jq -r '.filename' <<< "$entry")"
+            # Renames also count their old path.
+            mapfile -t paths < <(jq -r '.filename, (.previous_filename // empty)' <<< "$entry")
+            matched=""
+            for path in "${paths[@]}"; do
+              for pattern in "${patterns[@]}"; do
+                if [[ "$pattern" == */* ]]; then
+                  subject="$path"
+                else
+                  subject="${path##*/}"
+                fi
+                # shellcheck disable=SC2053 # pattern match on purpose
+                if [[ "$subject" == $pattern ]]; then
+                  matched="$path (matches '$pattern')"
+                  break 2
+                fi
+              done
             done
-          done
+            # OpenTofu: provider and module versions and sources live in
+            # any .tf file, so the changed lines are inspected. Without a
+            # diff (too large or binary), the file counts as protected.
+            if [ -z "$matched" ] && [[ "$file" == *.tf || "$file" == *.tofu ]]; then
+              if ! jq -e 'has("patch")' <<< "$entry" > /dev/null; then
+                matched="$file (OpenTofu diff unavailable)"
+              elif grep -qiE '^[+-][[:space:]]*(source|version|required_version|required_providers)([[:space:]=]|$)' \
+                <<< "$(jq -r '.patch' <<< "$entry")"; then
+                matched="$file (OpenTofu source or version changed)"
+              fi
+            fi
+            if [ -n "$matched" ]; then matches+=("$matched"); fi
+          done < "$work/files.jsonl"
 
           if [ "${#matches[@]}" -eq 0 ]; then
             echo "No protected paths changed."
@@ -163,22 +226,44 @@ jobs:
           echo "Protected paths changed:"
           printf '  %s\n' "${matches[@]}"
 
-          labels="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.labels[].name')"
-          # Who applied the label last. Bots (GitHub Apps used by agents)
-          # cannot approve their own pull requests.
-          labeler_type="$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/events" \
-            --jq ".[] | select(.event == \"labeled\" and .label.name == \"$APPROVAL_LABEL\") | .actor.type" \
-            | tail -n 1)"
-
-          if ! grep -qxF "$APPROVAL_LABEL" <<< "$labels"; then
-            echo "::error::This pull request changes protected paths and needs the '$APPROVAL_LABEL' label, applied by a human."
-            exit 1
+          if ! jq -e --arg label "$APPROVAL_LABEL" 'any(.labels[]; .name == $label)' "$work/pr.json" > /dev/null; then
+            fail "This pull request changes protected paths and needs the '$APPROVAL_LABEL' label, applied by a human."
           fi
+          # The last application of the label must come from a person (bots,
+          # like the GitHub App used by agents, cannot approve) and must be
+          # newer than the last push: new commits require a new approval.
+          gh api --paginate "repos/$REPO/issues/$PR_NUMBER/events?per_page=100" \
+            --jq '.[] | @json' > "$work/events.jsonl" \
+            || fail "Could not read the events of the pull request."
+          label_event="$(jq -c --arg label "$APPROVAL_LABEL" \
+            'select(.event == "labeled" and .label.name == $label)' \
+            "$work/events.jsonl" | tail -n 1)"
+          labeler_type="$(jq -r '.actor.type // empty' <<< "${label_event:-null}")"
+          labeled_at="$(jq -r '.created_at // empty' <<< "${label_event:-null}")"
           if [ "$labeler_type" != "User" ]; then
-            echo "::error::The '$APPROVAL_LABEL' label was applied by a ${labeler_type:-unknown actor}, not by a human. Remove it and let a person apply it."
-            exit 1
+            fail "The '$APPROVAL_LABEL' label was applied by a ${labeler_type:-unknown actor}, not by a human. Remove it and let a person apply it."
           fi
-          echo "Approved: '$APPROVAL_LABEL' applied by a human."
+
+          # When the current head arrived: the first pull_request run for
+          # its SHA (created by the push), or the last force push, whichever
+          # is newer. Commit dates are not used; they come from the author.
+          head_sha="$(jq -r '.head.sha' "$work/pr.json")"
+          gh api --paginate "repos/$REPO/actions/runs?event=pull_request&head_sha=$head_sha&per_page=100" \
+            --jq '.workflow_runs[].created_at' > "$work/runs.txt" \
+            || fail "Could not read the workflow runs of the head commit."
+          first_run_at="$(sort "$work/runs.txt" | head -n 1)"
+          force_pushed_at="$(jq -r 'select(.event == "head_ref_force_pushed") | .created_at' \
+            "$work/events.jsonl" | sort | tail -n 1)"
+          if [ -z "$first_run_at" ]; then
+            fail "Could not find when the head commit $head_sha was pushed."
+          fi
+          pushed_at="$(printf '%s\n' "$first_run_at" "$force_pushed_at" | sort | tail -n 1)"
+
+          # Timestamps are ISO 8601 in UTC, so text order is time order.
+          if [[ ! "$labeled_at" > "$pushed_at" ]]; then
+            fail "The '$APPROVAL_LABEL' label ($labeled_at) is older than the last push ($pushed_at). Remove it and apply it again after reviewing the new commits."
+          fi
+          echo "Approved: '$APPROVAL_LABEL' applied by a human at $labeled_at, after the last push at $pushed_at."
 
   rust:
     runs-on: ubuntu-24.04
