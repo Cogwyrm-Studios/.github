@@ -146,6 +146,8 @@ jobs:
             'constraints*.txt' Pipfile setup.py setup.cfg go.mod Gemfile
             composer.json flake.nix rust-toolchain rust-toolchain.toml
             .npmrc .yarnrc .yarnrc.yml .tool-versions '.cargo/*' '*/.cargo/*'
+            # OpenTofu in JSON syntax (always protected; .tf is inspected below).
+            '*.tf.json' '*.tofu.json'
             # CI, repository automation and secret scanning rules.
             '.github/*' .gitleaks.toml .gitleaksignore
             # Secret encryption rules.
@@ -205,14 +207,18 @@ jobs:
               done
             done
             # OpenTofu: provider and module versions and sources live in
-            # any .tf file, so the changed lines are inspected. Without a
+            # any .tf file, so every added or removed line is inspected for
+            # the keywords anywhere in it (inline blocks included). Without a
             # diff (too large or binary), the file counts as protected.
             if [ -z "$matched" ] && [[ "$file" == *.tf || "$file" == *.tofu ]]; then
               if ! jq -e 'has("patch")' <<< "$entry" > /dev/null; then
                 matched="$file (OpenTofu diff unavailable)"
-              elif grep -qiE '^[+-][[:space:]]*(source|version|required_version|required_providers)([[:space:]=]|$)' \
-                <<< "$(jq -r '.patch' <<< "$entry")"; then
-                matched="$file (OpenTofu source or version changed)"
+              else
+                patch="$(jq -r '.patch' <<< "$entry")"
+                if grep -qiE '^[+-](.*[^[:alnum:]_])?(required_providers|required_version)([^[:alnum:]_]|$)' <<< "$patch" \
+                  || grep -qiE '^[+-](.*[^[:alnum:]_])?(source|version)[[:space:]]*=' <<< "$patch"; then
+                  matched="$file (OpenTofu source or version changed)"
+                fi
               fi
             fi
             if [ -n "$matched" ]; then matches+=("$matched"); fi
@@ -244,18 +250,27 @@ jobs:
             fail "The '$APPROVAL_LABEL' label was applied by a ${labeler_type:-unknown actor}, not by a human. Remove it and let a person apply it."
           fi
 
-          # When the current head arrived: the first pull_request run for
-          # its SHA (created by the push), or the last force push, whichever
-          # is newer. Commit dates are not used; they come from the author.
+          # When the current head arrived in THIS pull request: the first
+          # pull_request run for its SHA on this head branch and linked to
+          # this pull request (the run is created by the push), or the last
+          # force push, whichever is newer. Runs of the same commit on other
+          # branches or pull requests do not count. Commit dates are not
+          # used; they come from the author. No matching run: fail closed.
           head_sha="$(jq -r '.head.sha' "$work/pr.json")"
+          head_ref="$(jq -r '.head.ref' "$work/pr.json")"
           gh api --paginate "repos/$REPO/actions/runs?event=pull_request&head_sha=$head_sha&per_page=100" \
-            --jq '.workflow_runs[].created_at' > "$work/runs.txt" \
+            --jq '.workflow_runs[] | @json' > "$work/runs.jsonl" \
             || fail "Could not read the workflow runs of the head commit."
-          first_run_at="$(sort "$work/runs.txt" | head -n 1)"
+          first_run_at="$(jq -r --arg sha "$head_sha" --arg ref "$head_ref" --arg repo "$REPO" \
+            --argjson pr "$PR_NUMBER" \
+            'select(.event == "pull_request" and .head_sha == $sha and .head_branch == $ref
+              and .head_repository.full_name == $repo
+              and any(.pull_requests[]?; .number == $pr)) | .created_at' \
+            "$work/runs.jsonl" | sort | head -n 1)"
           force_pushed_at="$(jq -r 'select(.event == "head_ref_force_pushed") | .created_at' \
             "$work/events.jsonl" | sort | tail -n 1)"
           if [ -z "$first_run_at" ]; then
-            fail "Could not find when the head commit $head_sha was pushed."
+            fail "Could not find when the head commit $head_sha was pushed to this pull request."
           fi
           pushed_at="$(printf '%s\n' "$first_run_at" "$force_pushed_at" | sort | tail -n 1)"
 

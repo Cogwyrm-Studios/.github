@@ -39,7 +39,7 @@ No `infra`, também `infra / tofu` e `infra / kubeconform`.
 
 ### Portão de aprovação humana
 
-O `human-gate` falha quando o pull request mexe num caminho protegido, a menos que tenha a label `human-approved` colocada por uma pessoa. Label colocada por um bot (GitHub App dos agentes) não vale. O check roda de novo quando labels são colocadas ou tiradas, então basta colocar a label para liberar o merge. A label só vale se foi colocada depois do último push: commits novos (ou um force push) invalidam a aprovação, e o portão pede para tirar e colocar a label de novo depois de revisar. O momento do push vem da primeira execução de workflow do commit do head (criada pelo próprio push) ou do último force push, o que for mais recente; a data do commit não é usada, porque quem faz o commit escolhe a data.
+O `human-gate` falha quando o pull request mexe num caminho protegido, a menos que tenha a label `human-approved` colocada por uma pessoa. Label colocada por um bot (GitHub App dos agentes) não vale. O check roda de novo quando labels são colocadas ou tiradas, então basta colocar a label para liberar o merge. A label só vale se foi colocada depois do último push: commits novos (ou um force push) invalidam a aprovação, e o portão pede para tirar e colocar a label de novo depois de revisar. O momento do push é o mais recente entre a primeira execução de workflow do commit do head **neste PR** (evento `pull_request`, mesma branch e ligada a este PR, criada pelo próprio push) e o último force push. Execuções do mesmo commit em outra branch ou outro PR não contam, para que um fast-forward para um commit antigo não herde a aprovação. Sem execução correspondente, o portão falha. A data do commit não é usada, porque quem faz o commit escolhe a data.
 
 Se a API do GitHub falhar, o portão falha; ele nunca passa por padrão. Também falha se o PR mexe em 3000 arquivos ou mais (o limite da API que lista os arquivos): nesse caso, divida o PR.
 
@@ -47,7 +47,7 @@ Caminhos protegidos por padrão:
 
 - **Lockfiles** (dependências novas): `Cargo.lock`, `package-lock.json`, `npm-shrinkwrap.json`, `pnpm-lock.yaml`, `yarn.lock`, `bun.lock`, `bun.lockb`, `.terraform.lock.hcl`, `go.sum`, `poetry.lock`, `uv.lock`, `Pipfile.lock`, `Gemfile.lock`, `composer.lock` e `flake.lock`.
 - **Manifestos de dependência e toolchain:** `Cargo.toml`, `package.json`, `pyproject.toml`, `requirements*.txt`, `constraints*.txt`, `Pipfile`, `setup.py`, `setup.cfg`, `go.mod`, `Gemfile`, `composer.json`, `flake.nix`, `rust-toolchain`, `rust-toolchain.toml`, `.npmrc`, `.yarnrc`, `.yarnrc.yml`, `.tool-versions` e a pasta `.cargo/`.
-- **OpenTofu:** arquivo `.tf` ou `.tofu` cujo diff adiciona ou remove uma linha `source`, `version`, `required_version` ou `required_providers` (providers e módulos). Se o GitHub não mostrar o diff do arquivo, ele conta como protegido.
+- **OpenTofu:** todo `*.tf.json` e `*.tofu.json`; e arquivo `.tf` ou `.tofu` cujo diff adiciona ou remove uma linha com `source =`, `version =`, `required_version` ou `required_providers` em qualquer posição (inclusive blocos numa linha só, como `aws = { source = "...", version = "..." }`). Se o GitHub não mostrar o diff do arquivo, ele conta como protegido.
 - **CI e regras de varredura:** tudo em `.github/` (inclusive os workflows, para que um PR não troque o próprio portão), `.gitleaks.toml` e `.gitleaksignore`.
 - **Cifragem de segredos:** `.sops.yaml`.
 - **Autenticação:** pastas `auth/`, `oauth/`, `authentication/` e `login/`, e arquivos `auth.*`, `auth_*`, `*_auth.*` e `oauth*`.
@@ -134,7 +134,14 @@ O `ci.yml` deste repositório chama a cópia local (`./.github/workflows/checks.
 
 ### Limite conhecido: o caller pode ser trocado
 
-O ruleset só confere o nome do check, e o workflow que roda num PR é o do próprio PR. Um PR pode trocar o `ci.yml` por outro com jobs de mesmo nome que só passam. O portão cobre isso ao proteger `.github/`, mas o portão que roda é o do PR. Por isso, mudanças em `.github/` só entram com revisão atenta do Denilson.
+O ruleset só confere o nome do check, e o workflow que roda num PR é o do próprio PR. Um PR pode trocar o `ci.yml` por outro com jobs de mesmo nome que só passam. O portão protege `.github/`, mas quem roda é o portão do PR. Por isso, mudanças em `.github/` só entram com revisão atenta do Denilson.
+
+A regra de ruleset "Require workflows to pass before merging", que resolveria isso, só existe no GitHub Enterprise Cloud. Mesmo lá, ela ignora `types` e não roda em `labeled`/`unlabeled`. Mitigação prevista no plano Team:
+
+- **GitHub App dos agentes sem a permissão "Workflows":** o GitHub recusa push de App sem essa permissão que mexa em `.github/workflows/`, em qualquer repositório, inclusive neste, que é público.
+- **Push ruleset "Restrict file paths" em `.github/workflows/**`** nos repositórios privados, com bypass só para o Denilson.
+
+Um caller sem `labeled` e `unlabeled` em `types` nunca libera um PR protegido: colocar a label não roda o portão de novo, e o check continua falhando até outro push, que por sua vez invalida a label. Use sempre o caller documentado abaixo.
 
 ### Segurança e custo
 
