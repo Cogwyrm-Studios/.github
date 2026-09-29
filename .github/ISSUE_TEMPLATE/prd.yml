@@ -1,0 +1,175 @@
+name: PRD
+description: Documento de requisitos de produto. Diz por quê, para quem e como medir o sucesso; o detalhe vai para a change do OpenSpec.
+title: "[PRD] "
+labels: ["prd"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Guia: [PRDs no GitHub](https://github.com/Cogwyrm-Studios/handbook/blob/main/guides/prd.md).
+        Fique no nível do problema e do resultado. Requisitos detalhados e cenários vão para a change do OpenSpec, que sai depois de o PRD ser aprovado.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Resumo
+      description: Uma ou duas frases dizendo o que é e para quem.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: type
+    attributes:
+      label: Tipo
+      options:
+        - Feature de jogo
+        - Conteúdo (zona, quest, item, evento)
+        - Ferramenta interna
+        - Infraestrutura
+        - Marketing e comunidade
+    validations:
+      required: true
+
+  - type: dropdown
+    id: game
+    attributes:
+      label: Jogo
+      options:
+        - orrery
+        - Jogo menor do universe
+        - Estúdio (todos ou nenhum jogo)
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problema
+      description: Qual dor ou oportunidade, para quem, e por que agora. Evidências ajudam (feedback, playtest, dados).
+    validations:
+      required: true
+
+  - type: textarea
+    id: goals
+    attributes:
+      label: Objetivos
+      description: 'Resultados esperados, não entregas. Ex.: "o jogador entende o combate em 5 minutos", e não "fazer um tutorial".'
+      value: |
+        1.
+    validations:
+      required: true
+
+  - type: textarea
+    id: non-goals
+    attributes:
+      label: Fora de escopo
+      description: O que conscientemente não entra, para o escopo não crescer sozinho.
+      value: |
+        -
+    validations:
+      required: true
+
+  - type: textarea
+    id: metrics
+    attributes:
+      label: Métricas
+      description: |
+        A coluna "Como medir" é obrigatória: se ainda não dá para medir, diga como vamos medir (playtest, Steamworks, questionário, logs).
+        Exemplos: conclusão do tutorial em playtest, retenção D1/D7, sessões sem crash, nota das avaliações na Steam, wishlists, conversão de wishlist em venda, custo/mês, horas economizadas por semana.
+      value: |
+        | Métrica | Hoje | Meta | Prazo | Como medir |
+        |---|---|---|---|---|
+        |  |  |  |  |  |
+    validations:
+      required: true
+
+  - type: textarea
+    id: guardrails
+    attributes:
+      label: Métricas de guarda
+      description: O que não pode piorar (crashes, tempo de carregamento, custo/mês, frame time).
+      value: |
+        | Métrica | Limite |
+        |---|---|
+        |  |  |
+
+  - type: textarea
+    id: hypothesis
+    attributes:
+      label: Hipótese
+      description: Acreditamos que [mudança] para [quem] vai causar [resultado]; saberemos quando [métrica] chegar a [meta].
+
+  - type: textarea
+    id: requirements
+    attributes:
+      label: Requisitos
+      description: Em alto nível e com prioridade. O detalhe (cenários, regras) vai para a spec do OpenSpec.
+      value: |
+        **Must**
+        -
+
+        **Should**
+        -
+
+        **Could**
+        -
+
+  - type: textarea
+    id: experience
+    attributes:
+      label: Experiência
+      description: Fluxo do jogador ou do usuário, referências, esboços. Concept gerado por IA só como referência (ADR 0014).
+
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Restrições e aprovações
+      description: Marque o que se aplica. Cada item marcado exige o cuidado indicado.
+      options:
+        - label: Mexe no lore ou no cânone (revisão do `lore-keeper`)
+        - label: Usa texto ou tradução com rascunho de IA (declarar na Steam, ADR 0014)
+        - label: Cria custo recorrente (aprovação do Denilson)
+        - label: Traz dependência nova (aprovação do Denilson)
+        - label: Envolve autenticação, pagamentos ou dados de jogadores (aprovação do Denilson)
+        - label: Contradiz ou exige um ADR
+
+  - type: textarea
+    id: risks
+    attributes:
+      label: Riscos e premissas
+      description: O que pode dar errado, e o que estamos supondo sem ter confirmado.
+
+  - type: dropdown
+    id: size
+    attributes:
+      label: Tamanho
+      description: "P: até uma semana. M: algumas semanas. G: um mês ou mais (considere dividir)."
+      options:
+        - P
+        - M
+        - G
+
+  - type: input
+    id: milestone
+    attributes:
+      label: Marco
+      description: A qual marco do estúdio este PRD serve (veja o `producer`).
+
+  - type: textarea
+    id: done
+    attributes:
+      label: Critério de pronto
+      description: Quando o PRD está concluído? Basta lançar, ou é preciso atingir a meta das métricas?
+
+  - type: textarea
+    id: questions
+    attributes:
+      label: Perguntas em aberto
+      value: |
+        - [ ]
+
+  - type: textarea
+    id: links
+    attributes:
+      label: Links
+      description: Change do OpenSpec, ADRs, issues relacionadas. As tarefas entram como sub-issues.
