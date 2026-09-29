@@ -1,0 +1,147 @@
+# Reusable infrastructure checks: OpenTofu (fmt and validate) and
+# kubeconform on Kubernetes manifests. Only the infra repository calls it.
+# Like checks.yml, every job always reports and passes after a notice when
+# there is nothing to check.
+name: infra-checks
+
+on:
+  workflow_call:
+    inputs:
+      tofu-version:
+        description: OpenTofu version; keep it equal to required_version in the code.
+        type: string
+        default: "1.12.6"
+      tofu-directory:
+        description: Directory with the OpenTofu code (roots and modules).
+        type: string
+        default: tofu
+      kubernetes-paths:
+        description: Space-separated directories with Kubernetes manifests; missing ones are ignored.
+        type: string
+        default: "clusters apps platform manifests"
+      kubernetes-version:
+        description: Kubernetes version used for the schemas.
+        type: string
+        default: "1.37.0"
+
+permissions:
+  contents: read
+
+env:
+  KUBECONFORM_VERSION: "0.8.0"
+  KUBECONFORM_SHA256: "9bc2bffbf71f261128533edaf912153948b7ff238f9a531ae6d34466ec287883"
+
+jobs:
+  tofu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      TOFU_DIR: ${{ inputs.tofu-directory }}
+      TF_IN_AUTOMATION: "1"
+      TF_INPUT: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Detect OpenTofu code
+        id: detect
+        run: |
+          if [ -d "$TOFU_DIR" ] && find "$TOFU_DIR" -name '*.tf' -not -path '*/.terraform/*' | grep -q .; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No OpenTofu code in $TOFU_DIR; nothing to check."
+          fi
+
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        if: steps.detect.outputs.present == 'true'
+        with:
+          tofu_version: ${{ inputs.tofu-version }}
+          tofu_wrapper: false
+
+      - name: tofu fmt
+        if: steps.detect.outputs.present == 'true'
+        run: tofu fmt -check -recursive -diff "$TOFU_DIR"
+
+      # Every directory with .tf files is validated: roots and modules. The
+      # backend is not configured, so no state or credentials are needed.
+      # Roots with a committed lock file must match it.
+      - name: tofu validate
+        if: steps.detect.outputs.present == 'true'
+        run: |
+          set -euo pipefail
+          export TF_PLUGIN_CACHE_DIR="$RUNNER_TEMP/tofu-plugins"
+          mkdir -p "$TF_PLUGIN_CACHE_DIR"
+          status=0
+          while IFS= read -r dir; do
+            echo "::group::$dir"
+            lock=()
+            if [ -f "$dir/.terraform.lock.hcl" ]; then lock=(-lockfile=readonly); fi
+            if tofu -chdir="$dir" init -backend=false "${lock[@]}" -no-color >/dev/null \
+              && tofu -chdir="$dir" validate -no-color; then
+              echo "::endgroup::"
+            else
+              echo "::endgroup::"
+              echo "::error::tofu validate failed in $dir"
+              status=1
+            fi
+          done < <(find "$TOFU_DIR" -name '*.tf' -not -path '*/.terraform/*' -printf '%h\n' | sort -u)
+          exit "$status"
+
+  kubeconform:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      KUBERNETES_PATHS: ${{ inputs.kubernetes-paths }}
+      KUBERNETES_VERSION: ${{ inputs.kubernetes-version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Detect manifests
+        id: detect
+        run: |
+          set -euo pipefail
+          dirs=()
+          for dir in $KUBERNETES_PATHS; do
+            if [ -d "$dir" ]; then dirs+=("$dir"); fi
+          done
+          if [ "${#dirs[@]}" -gt 0 ] && find "${dirs[@]}" -name '*.y*ml' | grep -q .; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+            echo "dirs=${dirs[*]}" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No Kubernetes manifests in: $KUBERNETES_PATHS; nothing to check."
+          fi
+
+      - name: Install kubeconform
+        if: steps.detect.outputs.present == 'true'
+        run: |
+          set -euo pipefail
+          archive="kubeconform-linux-amd64.tar.gz"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$archive" \
+            "https://github.com/yannh/kubeconform/releases/download/v${KUBECONFORM_VERSION}/${archive}"
+          echo "${KUBECONFORM_SHA256}  $RUNNER_TEMP/$archive" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" kubeconform
+
+      # SOPS-encrypted files carry an extra "sops" key and are skipped.
+      # Custom resources without a published schema (Argo CD, Agones) are
+      # skipped too, and listed in the summary.
+      - name: kubeconform
+        if: steps.detect.outputs.present == 'true'
+        env:
+          DIRS: ${{ steps.detect.outputs.dirs }}
+        run: |
+          # shellcheck disable=SC2086 # DIRS is a space-separated list
+          "$RUNNER_TEMP/kubeconform" -strict -summary -verbose \
+            -kubernetes-version "$KUBERNETES_VERSION" \
+            -ignore-missing-schemas \
+            -ignore-filename-pattern '\.(sops|enc)\.ya?ml$' \
+            -ignore-filename-pattern '(^|/)kustomization\.ya?ml$' \
+            $DIRS

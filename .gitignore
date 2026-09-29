@@ -1,2 +1,5 @@
 # Obsidian (configuração local do vault)
 .obsidian/
+
+# Dependências instaladas localmente
+node_modules/

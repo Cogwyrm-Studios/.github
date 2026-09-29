@@ -1,0 +1,20 @@
+# CI of this repository. It calls the local copy of the reusable workflow,
+# so a pull request here runs the version it changes.
+name: ci
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    uses: ./.github/workflows/checks.yml
