@@ -1,0 +1,238 @@
+# Reusable CI checks shared by every repository of the organization.
+#
+# Every job always runs and reports, so all repositories produce the same
+# check names (see README.md). A job whose check does not apply to the
+# repository (no openspec/, no Cargo.toml, not a pull request) passes after
+# a notice instead of being skipped.
+name: checks
+
+on:
+  workflow_call:
+    inputs:
+      protected-paths:
+        description: >-
+          Extra patterns for the human gate, one per line (# starts a comment).
+          A pattern without "/" matches the file name in any directory; a
+          pattern with "/" matches the whole path. "*" also matches "/".
+        type: string
+        default: ""
+      rust-directory:
+        description: Directory that holds the Cargo.toml (crate or workspace root).
+        type: string
+        default: "."
+
+permissions:
+  contents: read
+
+env:
+  GITLEAKS_VERSION: "8.30.1"
+  GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+  OPENSPEC_VERSION: "1.13.2"
+  NODE_VERSION: "22"
+  APPROVAL_LABEL: human-approved
+
+jobs:
+  gitleaks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install gitleaks
+        run: |
+          set -euo pipefail
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$archive" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${archive}"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/$archive" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" gitleaks
+
+      # Full history, values redacted. A .gitleaks.toml or .gitleaksignore at
+      # the repository root is picked up automatically.
+      - name: Scan git history
+        run: '"$RUNNER_TEMP/gitleaks" git --redact --no-banner --exit-code 1 .'
+
+  openspec:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Detect openspec/
+        id: detect
+        run: |
+          if [ -d openspec ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No openspec/ directory; nothing to validate."
+          fi
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        if: steps.detect.outputs.present == 'true'
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Validate changes and specs
+        if: steps.detect.outputs.present == 'true'
+        env:
+          OPENSPEC_TELEMETRY: "0"
+          DO_NOT_TRACK: "1"
+          OPENSPEC_NO_UPDATE_CHECK: "1"
+        run: npx --yes "@fission-ai/openspec@${OPENSPEC_VERSION}" validate --all --strict --no-interactive
+
+  human-gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Not a pull request
+        if: github.event_name != 'pull_request'
+        run: echo "::notice::The human gate only applies to pull requests."
+
+      - name: Check protected paths
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EXTRA_PATTERNS: ${{ inputs.protected-paths }}
+        run: |
+          set -euo pipefail
+          shopt -s nocasematch
+
+          patterns=(
+            # Lockfiles: new or updated dependencies.
+            Cargo.lock package-lock.json npm-shrinkwrap.json pnpm-lock.yaml
+            yarn.lock bun.lock bun.lockb .terraform.lock.hcl go.sum
+            poetry.lock uv.lock Pipfile.lock Gemfile.lock composer.lock flake.lock
+            # Secret encryption rules.
+            .sops.yaml
+            # Authentication.
+            'auth/*' '*/auth/*' 'oauth/*' '*/oauth/*'
+            'authentication/*' '*/authentication/*' 'login/*' '*/login/*'
+            'auth.*' 'auth_*' '*_auth.*' 'oauth*'
+            # Payments.
+            'payment/*' '*/payment/*' 'payments/*' '*/payments/*'
+            'billing/*' '*/billing/*' 'purchase/*' '*/purchase/*'
+            'purchases/*' '*/purchases/*' 'payment*' '*_payment*' 'billing*'
+          )
+          while IFS= read -r line; do
+            line="${line%%#*}"
+            line="${line#"${line%%[![:space:]]*}"}"
+            line="${line%"${line##*[![:space:]]}"}"
+            if [ -n "$line" ]; then patterns+=("$line"); fi
+          done <<< "$EXTRA_PATTERNS"
+
+          # Renames also count their old path.
+          mapfile -t files < <(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/files" \
+            --jq '.[] | .filename, (.previous_filename // empty)')
+
+          matches=()
+          for file in "${files[@]}"; do
+            for pattern in "${patterns[@]}"; do
+              if [[ "$pattern" == */* ]]; then
+                subject="$file"
+              else
+                subject="${file##*/}"
+              fi
+              # shellcheck disable=SC2053 # pattern match on purpose
+              if [[ "$subject" == $pattern ]]; then
+                matches+=("$file (matches '$pattern')")
+                break
+              fi
+            done
+          done
+
+          if [ "${#matches[@]}" -eq 0 ]; then
+            echo "No protected paths changed."
+            exit 0
+          fi
+
+          echo "Protected paths changed:"
+          printf '  %s\n' "${matches[@]}"
+
+          labels="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.labels[].name')"
+          # Who applied the label last. Bots (GitHub Apps used by agents)
+          # cannot approve their own pull requests.
+          labeler_type="$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/events" \
+            --jq ".[] | select(.event == \"labeled\" and .label.name == \"$APPROVAL_LABEL\") | .actor.type" \
+            | tail -n 1)"
+
+          if ! grep -qxF "$APPROVAL_LABEL" <<< "$labels"; then
+            echo "::error::This pull request changes protected paths and needs the '$APPROVAL_LABEL' label, applied by a human."
+            exit 1
+          fi
+          if [ "$labeler_type" != "User" ]; then
+            echo "::error::The '$APPROVAL_LABEL' label was applied by a ${labeler_type:-unknown actor}, not by a human. Remove it and let a person apply it."
+            exit 1
+          fi
+          echo "Approved: '$APPROVAL_LABEL' applied by a human."
+
+  rust:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_DIR: ${{ inputs.rust-directory }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Detect Cargo.toml
+        id: detect
+        run: |
+          if [ -f "$RUST_DIR/Cargo.toml" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No $RUST_DIR/Cargo.toml; nothing to check."
+          fi
+
+      # Uses rust-toolchain.toml when the repository has one; otherwise the
+      # stable toolchain that comes with the runner image.
+      - name: Set up the toolchain
+        if: steps.detect.outputs.present == 'true'
+        working-directory: ${{ inputs.rust-directory }}
+        run: |
+          set -euo pipefail
+          if [ -f rust-toolchain.toml ] || [ -f rust-toolchain ]; then
+            rustup toolchain install
+          fi
+          rustup component add rustfmt clippy
+          rustc --version
+          cargo --version
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: steps.detect.outputs.present == 'true'
+        with:
+          workspaces: ${{ inputs.rust-directory }}
+
+      - name: cargo fmt
+        if: steps.detect.outputs.present == 'true'
+        working-directory: ${{ inputs.rust-directory }}
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        if: steps.detect.outputs.present == 'true'
+        working-directory: ${{ inputs.rust-directory }}
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: cargo test
+        if: steps.detect.outputs.present == 'true'
+        working-directory: ${{ inputs.rust-directory }}
+        run: cargo test --locked
