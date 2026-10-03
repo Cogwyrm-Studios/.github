@@ -12,7 +12,7 @@ Nenhum repositório tem a lógica de CI própria: cada um tem só um `ci.yml` cu
 | --- | --- | --- |
 | [`checks.yml`](.github/workflows/checks.yml) | todos os repositórios | `gitleaks`, `openspec`, `human-gate` e `rust` |
 | [`infra-checks.yml`](.github/workflows/infra-checks.yml) | só o `infra` | `tofu` e `kubeconform` |
-| [`add-to-project.yml`](.github/workflows/add-to-project.yml) | todos os repositórios, pelo `project.yml` | Põe a issue ou o PR no [projeto da organização](https://github.com/orgs/Cogwyrm-Studios/projects/1) (veja [Projeto da organização](#projeto-da-organização)) |
+| [`add-to-project.yml`](.github/workflows/add-to-project.yml) | todos os repositórios privados, pelo `project.yml` | Põe a issue ou o PR no [projeto da organização](https://github.com/orgs/Cogwyrm-Studios/projects/1) (veja [Projeto da organização](#projeto-da-organização)) |
 
 Todo job roda sempre e informa um resultado. Quando a verificação não se aplica ao repositório (sem `openspec/`, sem `Cargo.toml`, sem código OpenTofu ou manifestos), o job passa com um aviso em vez de ser pulado. Assim todos os repositórios produzem os mesmos nomes de check, e uma falha anterior nunca é trocada por um "pulado".
 
@@ -166,7 +166,7 @@ Até existir o GitHub App dos agentes, também ficam como limite conhecido os co
 
 Toda issue e todo PR de todos os repositórios entram no [projeto 1 da organização](https://github.com/orgs/Cogwyrm-Studios/projects/1) (decisão do Denilson de 2026-10-03). O auto-add nativo dos Projects não serve: no plano Team são só 5 workflows, um por repositório, e ele não pega itens que já existem.
 
-Cada repositório tem um `project.yml` que chama o [`add-to-project.yml`](.github/workflows/add-to-project.yml) em `issues` (`opened`, `reopened`, `transferred`) e `pull_request_target` (`opened`, `reopened`). O workflow gera um token do GitHub App `cogwyrm-agents` (com [`actions/create-github-app-token`](https://github.com/actions/create-github-app-token)) e chama a mutation `addProjectV2ItemById` da API GraphQL. Pôr um item que já está no projeto não muda nada. Issue transferida entra pelo ID novo.
+Cada repositório privado tem um `project.yml` que chama o [`add-to-project.yml`](.github/workflows/add-to-project.yml) em `issues` (`opened`, `reopened`) e `pull_request_target` (`opened`, `reopened`). O workflow gera um token do GitHub App `cogwyrm-agents` (com [`actions/create-github-app-token`](https://github.com/actions/create-github-app-token)) e chama a mutation `addProjectV2ItemById` da API GraphQL. Pôr um item que já está no projeto não muda nada. Issue transferida de repositório continua no projeto (o campo `Repository` do item acompanha a issue), então `transferred` não é escutado.
 
 `project.yml` de um repositório:
 
@@ -175,7 +175,7 @@ name: project
 
 on:
   issues:
-    types: [opened, reopened, transferred]
+    types: [opened, reopened]
   pull_request_target:
     types: [opened, reopened]
 
@@ -190,12 +190,12 @@ jobs:
       app-private-key: ${{ secrets.AGENTS_APP_PRIVATE_KEY }}
 ```
 
-Neste repositório as issues estão desligadas, então o `project.yml` daqui só escuta `pull_request_target` e chama a cópia local.
-
 Requisitos:
 
 - GitHub App `cogwyrm-agents` com **Organization permissions → Projects: Read and write**, instalado no repositório.
 - Variável `AGENTS_APP_ID` e secret `AGENTS_APP_PRIVATE_KEY` da organização liberados para o repositório.
+
+Este repositório não tem caller: é público, e a chave privada do App, que é a credencial mestre dele, não é liberada para repositório público. Os PRs daqui entram no projeto pela carga com `gh`.
 
 Segurança:
 

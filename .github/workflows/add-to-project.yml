@@ -45,14 +45,13 @@ jobs:
           permission-pull-requests: read
 
       # Payload values go through env, never interpolated into the script.
-      # A transferred issue is added under its new node ID. Adding an item
-      # that is already in the project is a no-op.
+      # Adding an item that is already in the project is a no-op.
       - name: Add item to project
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           OWNER: ${{ github.repository_owner }}
           PROJECT_NUMBER: ${{ inputs.project-number }}
-          CONTENT_ID: ${{ github.event.changes.new_issue.node_id || github.event.issue.node_id || github.event.pull_request.node_id }}
+          CONTENT_ID: ${{ github.event.issue.node_id || github.event.pull_request.node_id }}
           PROJECT_QUERY: >-
             query($owner: String!, $number: Int!) {
             organization(login: $owner) { projectV2(number: $number) { id } } }
