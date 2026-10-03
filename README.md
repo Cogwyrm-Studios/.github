@@ -12,6 +12,7 @@ Nenhum repositório tem a lógica de CI própria: cada um tem só um `ci.yml` cu
 | --- | --- | --- |
 | [`checks.yml`](.github/workflows/checks.yml) | todos os repositórios | `gitleaks`, `openspec`, `human-gate` e `rust` |
 | [`infra-checks.yml`](.github/workflows/infra-checks.yml) | só o `infra` | `tofu` e `kubeconform` |
+| [`add-to-project.yml`](.github/workflows/add-to-project.yml) | todos os repositórios, pelo `project.yml` | Põe a issue ou o PR no [projeto da organização](https://github.com/orgs/Cogwyrm-Studios/projects/1) (veja [Projeto da organização](#projeto-da-organização)) |
 
 Todo job roda sempre e informa um resultado. Quando a verificação não se aplica ao repositório (sem `openspec/`, sem `Cargo.toml`, sem código OpenTofu ou manifestos), o job passa com um aviso em vez de ser pulado. Assim todos os repositórios produzem os mesmos nomes de check, e uma falha anterior nunca é trocada por um "pulado".
 
@@ -150,7 +151,7 @@ Até existir o GitHub App dos agentes, também ficam como limite conhecido os co
 
 ### Segurança e custo
 
-- Permissões mínimas, todas de leitura: `contents: read` e, só no `human-gate`, `pull-requests: read` (arquivos, labels e eventos do PR) e `actions: read` (quando o head chegou). O caller precisa conceder as três. Nenhum segredo, nenhum `pull_request_target`, checkout sem credenciais persistidas.
+- Nos checks de CI, permissões mínimas, todas de leitura: `contents: read` e, só no `human-gate`, `pull-requests: read` (arquivos, labels e eventos do PR) e `actions: read` (quando o head chegou). O caller precisa conceder as três. Nenhum segredo, nenhum `pull_request_target`, checkout sem credenciais persistidas.
 - Actions fixadas por SHA de commit, com a versão num comentário. Binários (gitleaks, kubeconform) fixados por versão e conferidos por SHA-256. OpenSpec fixado por lockfile, sem scripts de instalação.
 - Só roda em pull request, não em push na `main` (que só muda por PR). Jobs leves, com cache do cargo no `rust`.
 
@@ -160,3 +161,47 @@ Até existir o GitHub App dos agentes, também ficam como limite conhecido os co
 2. Nas actions, troque o SHA pelo commit da tag nova e atualize o comentário.
 3. No OpenSpec, mude a versão em `tools/openspec/package.json` e no `OPENSPEC_VERSION` do `checks.yml`, e regenere o lockfile com `npm install --package-lock-only --ignore-scripts` dentro de `tools/openspec/`.
 4. Versão nova de ferramenta ou action é dependência: PR em draft, com aprovação do Denilson.
+
+## Projeto da organização
+
+Toda issue e todo PR de todos os repositórios entram no [projeto 1 da organização](https://github.com/orgs/Cogwyrm-Studios/projects/1) (decisão do Denilson de 2026-10-03). O auto-add nativo dos Projects não serve: no plano Team são só 5 workflows, um por repositório, e ele não pega itens que já existem.
+
+Cada repositório tem um `project.yml` que chama o [`add-to-project.yml`](.github/workflows/add-to-project.yml) em `issues` (`opened`, `reopened`, `transferred`) e `pull_request_target` (`opened`, `reopened`). O workflow gera um token do GitHub App `cogwyrm-agents` (com [`actions/create-github-app-token`](https://github.com/actions/create-github-app-token)) e chama a mutation `addProjectV2ItemById` da API GraphQL. Pôr um item que já está no projeto não muda nada. Issue transferida entra pelo ID novo.
+
+`project.yml` de um repositório:
+
+```yaml
+name: project
+
+on:
+  issues:
+    types: [opened, reopened, transferred]
+  pull_request_target:
+    types: [opened, reopened]
+
+permissions: {}
+
+jobs:
+  project:
+    uses: Cogwyrm-Studios/.github/.github/workflows/add-to-project.yml@main
+    with:
+      app-id: ${{ vars.AGENTS_APP_ID }}
+    secrets:
+      app-private-key: ${{ secrets.AGENTS_APP_PRIVATE_KEY }}
+```
+
+Neste repositório as issues estão desligadas, então o `project.yml` daqui só escuta `pull_request_target` e chama a cópia local.
+
+Requisitos:
+
+- GitHub App `cogwyrm-agents` com **Organization permissions → Projects: Read and write**, instalado no repositório.
+- Variável `AGENTS_APP_ID` e secret `AGENTS_APP_PRIVATE_KEY` da organização liberados para o repositório.
+
+Segurança:
+
+- `pull_request_target` roda com segredos mesmo em PR de fork. Por isso o workflow **nunca faz checkout nem roda código do PR**: ele só lê o ID do item no payload do evento, passado por variável de ambiente, nunca interpolado no script.
+- O `GITHUB_TOKEN` fica sem nenhuma permissão (`permissions: {}`). O token do App vale só para o repositório do evento e é reduzido a `organization-projects: write`, `issues: read` e `pull-requests: read`; a action revoga o token no fim do job.
+- O secret vai explícito para o workflow reutilizável, nunca com `secrets: inherit`.
+- Mudar o `add-to-project.yml` ou um `project.yml` passa pelo portão `human-gate`, como todo `.github/`.
+
+Para pôr no projeto o que já existia antes do workflow, rode uma carga com `gh` (token com escopo `project`) e a mesma mutation: ela é idempotente.
