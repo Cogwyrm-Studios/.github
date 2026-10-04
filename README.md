@@ -61,7 +61,7 @@ gh api -X PUT orgs/Cogwyrm-Studios/rulesets/24209924 --input require-ci.json
 
 ### Portão de aprovação humana
 
-O `human-gate` falha quando o pull request mexe num caminho protegido, a menos que tenha a label `human-approved` colocada por uma pessoa. Label colocada por um bot (GitHub App dos agentes) não vale. O check roda de novo quando labels são colocadas ou tiradas, então basta colocar a label para liberar o merge. A label só vale se foi colocada depois da última mudança do PR: push de commits novos, force push, volta a um commit anterior ou troca da base. Depois disso, o portão pede para tirar e colocar a label de novo. A última mudança do head é a primeira execução de workflow do SHA atual **neste PR** (evento `pull_request`, mesma branch, ligada a este PR) que vem depois da última execução de qualquer outro SHA. Assim um commit que volta a ser o head, por exemplo por fast-forward, não herda uma aprovação antiga. Force push e troca de base contam pelos eventos `head_ref_force_pushed` e `base_ref_changed` do PR. A data do commit não é usada, porque quem faz o commit escolhe a data. Na dúvida (nenhuma execução correspondente), o portão falha. Os arquivos são sempre comparados com a base atual do PR.
+O `human-gate` falha quando o pull request mexe num caminho protegido, a menos que tenha a label `human-approved` colocada por uma pessoa. Label colocada por um bot (GitHub App dos agentes) não vale. O check roda de novo quando labels são colocadas ou tiradas, então basta colocar a label para liberar o merge. A label só vale se foi colocada depois da última mudança do PR: push de commits novos, force push, volta a um commit anterior ou troca da base. Depois disso, o portão pede para tirar e colocar a label de novo. A última mudança do head é a primeira execução de workflow do SHA atual **neste PR** (evento `pull_request`, mesma branch, ligada a este PR) que vem depois da última execução de qualquer outro SHA. Assim um commit que volta a ser o head, por exemplo por fast-forward, não herda uma aprovação antiga. Force push e troca de base contam pelos eventos `head_ref_force_pushed` e `base_ref_changed` do PR. A data do commit não é usada, porque quem faz o commit escolhe a data. Na dúvida (nenhuma execução correspondente), o portão falha. Os arquivos são sempre comparados com a base atual do PR. Independente da label, o portão também falha com link simbólico ou submódulo num local do Claude Code (veja [Links simbólicos e submódulos no Claude Code](#links-simbólicos-e-submódulos-no-claude-code)).
 
 Se a API do GitHub falhar, o portão falha; ele nunca passa por padrão. Também falha se o PR mexe em 3000 arquivos ou mais (o limite da API que lista os arquivos): nesse caso, divida o PR.
 
@@ -73,13 +73,35 @@ Caminhos protegidos por padrão:
 - **CI e regras de varredura:** tudo em `.github/` (inclusive os workflows, para que um PR não troque o próprio portão), `.gitleaks.toml` e `.gitleaksignore`.
 - **Cifragem de segredos:** `.sops.yaml`.
 - **Política da cadeia de suprimentos:** `deny.toml` (licenças, crates banidas, origens e avisos ignorados do `cargo-deny`) e `advisory-exceptions.json` (exceções do passo dos avisos do quinn).
-- **Claude Code:** `.claude/settings.json` e tudo em `.claude/hooks/`, na raiz ou em qualquer pasta (inclusive `.claude` ou `.claude/hooks` trocados por link simbólico). Os hooks rodam em toda sessão de toda máquina que puxa o repositório, e o `settings.json` define hooks, permissões e plugins.
+- **Claude Code:** o que roda comandos ou concede permissões em toda sessão de toda máquina que puxa o repositório. Na raiz ou em qualquer pasta:
+  - `.claude/settings*.json` (inclusive `settings.local.json`) e tudo em `.claude/hooks/` (inclusive `.claude` ou `.claude/hooks` trocados por link simbólico);
+  - hooks de plugin (`hooks/hooks.json`) e manifestos (`.claude-plugin/`, cujo `plugin.json` aceita `hooks` e `mcpServers`, e o `marketplace.json`);
+  - servidores MCP e LSP (`.mcp.json` e `.lsp.json`) e monitores de plugin (`monitors/monitors.json`);
+  - nos plugins em `plugins/<nome>/`: tudo em `hooks/` (os scripts que os hooks rodam), em `bin/` (vai para o `PATH` da ferramenta Bash) e o `settings.json`;
+  - `memory/RULES.md`, injetado em todo prompt pelo hook do workspace.
+- **Instruções do Claude Code:** todo `.md` sob `.claude/` ou `plugins/` (skills, agentes e comandos, na raiz ou aninhados). O frontmatter deles aceita `hooks`, `mcpServers`, `permissionMode` e `allowed-tools`, e o corpo roda comandos com `` !`comando` `` e blocos ` ```! `. O portão lê o diff do arquivo, como faz com o OpenTofu: o arquivo fica protegido se uma linha adicionada ou removida tiver uma dessas chaves em qualquer posição (inclusive entre aspas ou num mapa `{...}`), um comando embutido, um escape hexadecimal do YAML (`\x..`, `\u....`, que esconderia o nome da chave) ou uma chave explícita (`? `). Arquivo novo mostra todas as linhas no diff, e arquivo removido também. Arquivo renomeado ou copiado conta como protegido, porque o diff não mostra o frontmatter que mudou de lugar (um agente de plugin ignora `hooks`; o mesmo arquivo em `.claude/agents/` os executa). Sem diff (arquivo grande ou binário), conta como protegido.
 - **Autenticação:** pastas `auth/`, `oauth/`, `authentication/` e `login/`, e arquivos `auth.*`, `auth_*`, `*_auth.*` e `oauth*`.
 - **Pagamentos:** pastas `payment/`, `payments/`, `billing/`, `purchase/` e `purchases/`, e arquivos `payment*`, `*_payment*` e `billing*`.
 
 A comparação não diferencia maiúsculas de minúsculas. Um padrão sem `/` compara com o nome do arquivo em qualquer pasta; com `/`, compara com o caminho inteiro, e `*` também atravessa pastas. Arquivos renomeados contam também pelo caminho antigo.
 
 Cada repositório acrescenta os seus padrões pelo input `protected-paths`, um por linha (`#` começa um comentário).
+
+#### Regras para o Claude Code
+
+O portão só protege o que está nos caminhos acima. Para que isso baste:
+
+- **Um hook não executa nem faz `source` de nada fora de `.claude/hooks/`** (no plugin, fora da pasta `hooks/` dele). O mesmo vale para todo comando que a configuração versionada manda rodar: `statusLine`, servidores MCP e LSP, monitores e hooks no frontmatter. Programas instalados no sistema (`git`, `jq`) podem ser chamados; scripts e configuração do repositório, não.
+- **O que um hook injeta no contexto fica num caminho protegido**, como o `memory/RULES.md` lido pelo hook do workspace. Arquivo novo injetado por um hook entra na lista de caminhos protegidos no mesmo PR.
+- **O `plugin.json` aponta só para os locais padrão** (`hooks/hooks.json`, `.mcp.json`, `.lsp.json`, `skills/`, `agents/`, `commands/`). Um arquivo de hooks ou de servidores fora deles não é protegido depois do PR que o referencia.
+
+Quem revisa um PR com a label confere essas regras: o portão não lê o conteúdo dos scripts.
+
+#### Links simbólicos e submódulos no Claude Code
+
+O passo `Check Claude Code symlinks and submodules` falha, **com ou sem a label**, se a árvore do head do PR tiver um link simbólico (modo `120000` no git) ou um submódulo (modo `160000`) num local do Claude Code: `.claude/` e `.claude-plugin/` (inclusive as próprias pastas), `plugins/`, `hooks/hooks.json` (e a pasta `hooks` na raiz), `.mcp.json`, `.lsp.json`, `monitors/`, `memory/RULES.md` e a pasta `memory`, na raiz ou em qualquer pasta. Um link nesses locais faria um caminho não protegido valer como protegido: um PR mudaria o alvo sem passar pelo portão. Um submódulo traria arquivos de outro repositório, e trocar o commit dele mudaria esses arquivos sem que o diff os mostre. A única exceção é um link dentro de uma pasta `.claude/hooks/` cujo alvo, relativo, resolve para um caminho dentro dessa mesma pasta (a mais interna, se houver uma dentro de outra); alvo absoluto, alvo que sai da pasta e alvo que aponta para a própria pasta falham. A árvore inteira é verificada, não só os arquivos do PR, porque um link já existente deixaria passar uma mudança no alvo.
+
+O passo faz um checkout esparso só das árvores do commit (`--filter=blob:none`, nenhum arquivo no disco; nada do PR é executado), lê os modos com `git ls-tree` e busca pela API só o conteúdo dos links dentro de `.claude/hooks/`. A comparação ignora maiúsculas e minúsculas, porque o macOS lê `.Claude` como `.claude`.
 
 ### Como usar
 

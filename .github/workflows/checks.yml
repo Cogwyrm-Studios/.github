@@ -130,6 +130,129 @@ jobs:
         if: github.event_name != 'pull_request'
         run: echo "::notice::The human gate only applies to pull requests."
 
+      # Trees of the head commit only: a sparse checkout that matches no
+      # file fetches with --filter=blob:none and writes nothing to disk, so
+      # nothing from the pull request is read or run here. The next step
+      # reads file modes from the trees and the few blobs it needs from the
+      # API.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'pull_request'
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+          sparse-checkout: /.cogwyrm-human-gate-no-files
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      # A symlink would let an unprotected path stand in for a protected
+      # Claude Code file, so none is accepted in Claude Code locations,
+      # except a link inside a .claude/hooks/ directory that points to a
+      # path inside that same directory. Submodules are not accepted there
+      # either. The label does not override this.
+      # The whole head tree is checked, not only the changed files: a link
+      # already in place would let a change to its target bypass the gate.
+      - name: Check Claude Code symlinks and submodules
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          fail() {
+            echo "::error::$1"
+            exit 1
+          }
+
+          # Full paths, lowercase (macOS reads .Claude as .claude).
+          patterns=(
+            .claude '*/.claude' '.claude/*' '*/.claude/*'
+            .claude-plugin '*/.claude-plugin' '.claude-plugin/*' '*/.claude-plugin/*'
+            'plugins/*' '*/plugins/*'
+            hooks 'hooks/hooks.json' '*/hooks/hooks.json'
+            .mcp.json '*/.mcp.json' .lsp.json '*/.lsp.json'
+            monitors 'monitors/monitors.json' '*/monitors/monitors.json'
+            memory '*/memory' 'memory/rules.md' '*/memory/rules.md'
+          )
+
+          # Resolves "/dir/target" without touching the disk; fails when
+          # ".." climbs above the repository root.
+          normalize() {
+            local part
+            local -a parts out=()
+            IFS=/ read -r -a parts <<< "$1"
+            for part in "${parts[@]}"; do
+              case "$part" in
+                "" | .) ;;
+                ..)
+                  if [ "${#out[@]}" -eq 0 ]; then return 1; fi
+                  unset 'out[-1]'
+                  ;;
+                *) out+=("$part") ;;
+              esac
+            done
+            printf '/%s' "${out[@]}"
+          }
+
+          work="$RUNNER_TEMP/human-gate-symlinks"
+          mkdir -p "$work"
+          git ls-tree -r -z --full-tree HEAD > "$work/tree" \
+            || fail "Could not list the tree of the head commit."
+
+          violations=()
+          while IFS= read -r -d '' record; do
+            meta="${record%%$'\t'*}"
+            path="${record#*$'\t'}"
+            mode="${meta%% *}"
+            if [ "$mode" != 120000 ] && [ "$mode" != 160000 ]; then continue; fi
+            sha="${meta##* }"
+            lpath="${path,,}"
+            claude=""
+            for pattern in "${patterns[@]}"; do
+              # shellcheck disable=SC2053 # pattern match on purpose
+              if [[ "$lpath" == $pattern ]]; then claude=1; break; fi
+            done
+            if [ -z "$claude" ]; then continue; fi
+
+            # A submodule brings content from another repository: a bump of
+            # its commit would change Claude Code files unseen.
+            if [ "$mode" = 160000 ]; then
+              violations+=("$path (submodule in a Claude Code location)")
+              continue
+            fi
+            if [[ "$lpath" != .claude/hooks/* && "$lpath" != */.claude/hooks/* ]]; then
+              violations+=("$path (symlink in a Claude Code location)")
+              continue
+            fi
+            gh api "repos/$REPO/git/blobs/$sha" > "$work/blob.json" \
+              || fail "Could not read the target of the symlink $path."
+            jq -r '.content' "$work/blob.json" | base64 -d > "$work/target" \
+              || fail "Could not decode the target of the symlink $path."
+            # A target with a newline or NUL byte cannot be compared safely.
+            if [ "$(tr -d '\n\000' < "$work/target" | wc -c)" -ne "$(wc -c < "$work/target")" ]; then
+              violations+=("$path (symlink target with a newline or NUL byte)")
+              continue
+            fi
+            target="$(< "$work/target")"
+            ltarget="${target,,}"
+            # The innermost .claude/hooks directory that holds the link.
+            hooks_dir="/$lpath"
+            hooks_dir="${hooks_dir%/.claude/hooks/*}/.claude/hooks"
+            if [[ -z "$ltarget" || "$ltarget" == /* ]] \
+              || ! resolved="$(normalize "/${lpath%/*}/$ltarget")" \
+              || [[ "$resolved" != "$hooks_dir"/* ]]; then
+              violations+=("$path -> $target (points outside its .claude/hooks/ directory)")
+            fi
+          done < "$work/tree"
+
+          if [ "${#violations[@]}" -eq 0 ]; then
+            echo "No symlinks or submodules in Claude Code locations, other than links inside .claude/hooks/."
+            exit 0
+          fi
+          echo "Symlinks or submodules not allowed:"
+          printf '  %s\n' "${violations[@]}"
+          fail "Claude Code locations accept no symlinks or submodules, except links inside a .claude/hooks/ directory to a path in that same directory. The '$APPROVAL_LABEL' label does not override this."
+
       - name: Check protected paths
         if: github.event_name == 'pull_request'
         env:
@@ -164,12 +287,23 @@ jobs:
             # Supply chain policy: cargo-deny (licenses, bans, sources and
             # ignored advisories) and the exceptions of the advisory step.
             deny.toml advisory-exceptions.json
-            # Claude Code project settings and hooks: hooks run on every
-            # session of every machine that pulls the repository. A .claude
-            # or .claude/hooks that is a symlink shows up as a single file.
-            '.claude/settings.json' '*/.claude/settings.json'
+            # Claude Code: settings (hooks, permissions, plugins), hooks and
+            # the scripts they run, plugin manifests (plugin.json accepts
+            # hooks and mcpServers), MCP and LSP servers, plugin monitors,
+            # settings and executables, and the rules injected into every
+            # session. They run commands or grant permissions on every
+            # machine that pulls the repository. A .claude or .claude/hooks
+            # that is a symlink shows up as a single file. Markdown under
+            # .claude/ and plugins/ is inspected below (frontmatter hooks).
+            '.claude/settings*.json' '*/.claude/settings*.json'
             '.claude/hooks/*' '*/.claude/hooks/*' '.claude/hooks' '*/.claude/hooks'
             .claude
+            'hooks/hooks.json' '*/hooks/hooks.json'
+            '.claude-plugin/*' '*/.claude-plugin/*'
+            .mcp.json .lsp.json 'monitors/monitors.json' '*/monitors/monitors.json'
+            'plugins/*/hooks/*' '*/plugins/*/hooks/*' 'plugins/*/bin/*' '*/plugins/*/bin/*'
+            'plugins/*/settings.json' '*/plugins/*/settings.json'
+            'memory/RULES.md' '*/memory/RULES.md'
             # Authentication.
             'auth/*' '*/auth/*' 'oauth/*' '*/oauth/*'
             'authentication/*' '*/authentication/*' 'login/*' '*/login/*'
@@ -238,6 +372,34 @@ jobs:
                   matched="$file (OpenTofu source or version changed)"
                 fi
               fi
+            fi
+            # Claude Code skills, agents and commands: their frontmatter
+            # accepts hooks (and mcpServers, permissionMode, allowed-tools)
+            # and their body runs !`command` and ```! blocks. Every .md
+            # under a .claude/ or plugins/ directory is inspected: any added
+            # or removed line with one of those keys anywhere in it, an
+            # inline command, a YAML hex escape or an explicit key ("? ")
+            # protects the file. A new file shows all its lines and a
+            # removed one too. A rename or copy protects the file, because
+            # the diff does not show the frontmatter that moved. Without a
+            # diff (too large or binary), the file counts as protected.
+            if [ -z "$matched" ]; then
+              for path in "${paths[@]}"; do
+                if [[ "$path" == *.md && ( "$path" == .claude/* || "$path" == */.claude/* \
+                  || "$path" == plugins/* || "$path" == */plugins/* ) ]]; then
+                  if jq -e 'has("previous_filename")' <<< "$entry" > /dev/null; then
+                    matched="$path (Claude Code instructions renamed or copied)"
+                  elif ! jq -e 'has("patch")' <<< "$entry" > /dev/null; then
+                    matched="$path (Claude Code instructions diff unavailable)"
+                  elif patch="$(jq -r '.patch' <<< "$entry")" && grep -qiE \
+                    -e "^[+-](.*[^[:alnum:]_-])?[\"']?(hooks|mcpServers|permissionMode|allowed-?tools)[\"']?[[:space:]]*:" \
+                    -e '^[+-](.*[[:space:]])?!`' -e '^[+-][[:space:]]*(```|~~~)!' \
+                    -e '^[+-].*\\[xu][[:xdigit:]]{2}' -e '^[+-][[:space:]]*\?([[:space:]]|$)' <<< "$patch"; then
+                    matched="$path (Claude Code frontmatter key, inline command or YAML escape changed)"
+                  fi
+                  break
+                fi
+              done
             fi
             if [ -n "$matched" ]; then matches+=("$matched"); fi
           done < "$work/files.jsonl"
