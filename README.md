@@ -10,7 +10,7 @@ Nenhum repositório tem a lógica de CI própria: cada um tem só um `ci.yml` cu
 
 | Arquivo | Quem chama | O que faz |
 | --- | --- | --- |
-| [`checks.yml`](.github/workflows/checks.yml) | todos os repositórios | `gitleaks`, `openspec`, `human-gate` e `rust` |
+| [`checks.yml`](.github/workflows/checks.yml) | todos os repositórios | `gitleaks`, `openspec`, `human-gate`, `rust` e `deny` |
 | [`infra-checks.yml`](.github/workflows/infra-checks.yml) | só o `infra` | `tofu` e `kubeconform` |
 | [`add-to-project.yml`](.github/workflows/add-to-project.yml) | todos os repositórios privados, pelo `project.yml` | Põe a issue ou o PR no [projeto da organização](https://github.com/orgs/Cogwyrm-Studios/projects/1) (veja [Projeto da organização](#projeto-da-organização)) |
 
@@ -24,6 +24,7 @@ Todo job roda sempre e informa um resultado. Quando a verificação não se apli
 | `ci / openspec` | `openspec validate --all --strict` com o [OpenSpec](https://github.com/Fission-AI/OpenSpec) 1.13.2, sem telemetria. O CLI e todas as dependências dele vêm do lockfile em [`tools/openspec/`](tools/openspec/), instalados com `npm ci --ignore-scripts`. | Sem pasta `openspec/`. |
 | `ci / human-gate` | Portão de aprovação humana (veja abaixo). | Fora de pull request. |
 | `ci / rust` | `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings` e `cargo test --locked`. Usa o `rust-toolchain.toml` do repositório, se houver; senão, o stable da imagem do runner. | Sem `Cargo.toml` no diretório configurado. |
+| `ci / deny` | Cadeia de suprimentos do Rust ([orrery#49-D2](https://github.com/Cogwyrm-Studios/orrery/issues/49)): `cargo deny --locked check advisories licenses bans sources` com o [cargo-deny](https://github.com/EmbarkStudios/cargo-deny) 0.20.2 (binário da release com checksum SHA-256 conferido) e o `deny.toml` do repositório; qualquer erro de qualquer das quatro verificações bloqueia. **Falha se houver `Cargo.toml` sem `deny.toml`** no mesmo diretório. Depois, o passo dos avisos do quinn (veja [Avisos de segurança do quinn](#avisos-de-segurança-do-quinn)), que roda mesmo se o `cargo deny` falhar. | Sem `Cargo.toml` no diretório configurado. |
 | `infra / tofu` | `tofu fmt -check -recursive` e `tofu validate` em cada diretório com `.tf` dentro de `tofu/`, sem backend e sem credenciais. Diretórios com `.terraform.lock.hcl` têm que bater com ele. | Sem código OpenTofu. |
 | `infra / kubeconform` | Manifestos Kubernetes com o [kubeconform](https://github.com/yannh/kubeconform) 0.8.0 (checksum conferido), em modo estrito. Arquivos `*.sops.yaml`, `*.enc.yaml` e `kustomization.yaml` ficam de fora; recursos sem schema publicado (Argo CD, Agones) são contados como pulados. | Sem manifestos nos diretórios configurados. |
 
@@ -35,8 +36,28 @@ Os nomes seguem o padrão `<job do caller> / <job do workflow reutilizável>`. P
 - `ci / openspec`
 - `ci / human-gate`
 - `ci / rust`
+- `ci / deny` (a adicionar pelo Denilson, veja abaixo)
 
 No `infra`, também `infra / tofu` e `infra / kubeconform`.
+
+#### Adicionar `ci / deny` ao ruleset
+
+O ruleset `require-ci` é da organização e vale para todos os repositórios (`~ALL`, branch padrão). Só o Denilson muda ruleset, e na ordem certa:
+
+1. O `deny.toml` do orrery já está na `main` dele (sem ele, o `ci / deny` do orrery falha).
+2. O PR que cria o job `deny` entrou na `main` deste repositório. A partir daí todo caller passa a produzir `ci / deny` (os repositórios sem `Cargo.toml` passam com aviso).
+3. Em **Organization settings → Repository → Rulesets → `require-ci` → Require status checks to pass → Add checks**, digite `ci / deny` e escolha a origem **GitHub Actions**; salve.
+
+PR aberto antes do passo 2 não tem o check até rodar de novo: um push ou fechar e reabrir o PR resolve.
+
+Pela API, o equivalente (conferir a lista atual antes, porque o `PUT` substitui as regras):
+
+```sh
+gh api orgs/Cogwyrm-Studios/rulesets/24209924 > require-ci.json
+# acrescentar {"context": "ci / deny", "integration_id": 15368} em
+# rules[type=required_status_checks].parameters.required_status_checks
+gh api -X PUT orgs/Cogwyrm-Studios/rulesets/24209924 --input require-ci.json
+```
 
 ### Portão de aprovação humana
 
@@ -51,6 +72,7 @@ Caminhos protegidos por padrão:
 - **OpenTofu:** todo `*.tf.json` e `*.tofu.json`; e arquivo `.tf` ou `.tofu` cujo diff adiciona ou remove uma linha com `source =`, `version =`, `required_version` ou `required_providers` em qualquer posição (inclusive blocos numa linha só, como `aws = { source = "...", version = "..." }`). Se o GitHub não mostrar o diff do arquivo, ele conta como protegido.
 - **CI e regras de varredura:** tudo em `.github/` (inclusive os workflows, para que um PR não troque o próprio portão), `.gitleaks.toml` e `.gitleaksignore`.
 - **Cifragem de segredos:** `.sops.yaml`.
+- **Política da cadeia de suprimentos:** `deny.toml` (licenças, crates banidas, origens e avisos ignorados do `cargo-deny`).
 - **Autenticação:** pastas `auth/`, `oauth/`, `authentication/` e `login/`, e arquivos `auth.*`, `auth_*`, `*_auth.*` e `oauth*`.
 - **Pagamentos:** pastas `payment/`, `payments/`, `billing/`, `purchase/` e `purchases/`, e arquivos `payment*`, `*_payment*` e `billing*`.
 
@@ -113,6 +135,24 @@ jobs:
     uses: Cogwyrm-Studios/.github/.github/workflows/infra-checks.yml@main
 ```
 
+#### Execução diária
+
+Avisos de segurança aparecem sem nenhum commit. Para o `ci / deny` acusar um aviso novo mesmo sem PR aberto, todo repositório com `Cargo.toml` acrescenta um `schedule` ao `on:` do seu `ci.yml` (hoje, só o `orrery`):
+
+```yaml
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened, labeled, unlabeled]
+  schedule:
+    # Todo dia às 09:17 UTC (06:17 em Brasília), fora da hora cheia.
+    - cron: "17 9 * * *"
+```
+
+- A execução agendada roda na branch padrão. Nela, só o job `deny` trabalha: `gitleaks`, `openspec` e `rust` ficam pulados (nada mudou no código) e o `human-gate` passa com aviso. Ruleset não se aplica a execução agendada, então os pulados não bloqueiam nada.
+- Falha em execução agendada manda e-mail para quem por último mexeu na linha do `cron` no `ci.yml` (comportamento do GitHub), além de aparecer na aba Actions.
+- O `concurrency` do caller continua como está: sem PR, o grupo fica `ci-` e só existe uma execução agendada por vez.
+- Mudar o `ci.yml` do caller passa pelo `human-gate` (é `.github/`).
+
 O `ci.yml` deste repositório chama a cópia local (`./.github/workflows/checks.yml`), para que um PR aqui rode a versão que ele muda.
 
 ### Inputs
@@ -133,6 +173,29 @@ O `ci.yml` deste repositório chama a cópia local (`./.github/workflows/checks.
 | `kubernetes-paths` | `clusters apps platform manifests` | Pastas com manifestos, separadas por espaço; as que não existem são ignoradas. |
 | `kubernetes-version` | `1.37.0` | Versão do Kubernetes dos schemas. |
 
+### Avisos de segurança do quinn
+
+O `cargo-deny` só lê a [RustSec](https://rustsec.org/). O quinn publica a maior parte dos avisos dele só como GHSA no próprio repositório: em 2026, a RustSec tinha 2 dos 11, e quatro nem chegaram ao banco global do GitHub, então Dependabot e `osv-scanner` também não os veem (ata de [orrery#49](https://github.com/Cogwyrm-Studios/orrery/issues/49)). Por isso o job `deny` tem um passo próprio, [`tools/repo-advisories/check.sh`](tools/repo-advisories/check.sh), só com `bash`, `curl`, `awk` e `jq`, todos da imagem do runner:
+
+1. Lê do `Cargo.lock` as versões travadas de `quinn`, `quinn-proto` e `quinn-udp`. Se nenhum deles estiver no lock, termina com aviso, sem chamar a API.
+2. Lê todos os avisos publicados de `repos/quinn-rs/quinn/security-advisories` (`state=published`, seguindo a paginação por cursor), com o `GITHUB_TOKEN` do workflow. Se a API recusar o token (401, 403 ou 404), repete sem autenticação, com um aviso no log. Avisos retirados (`withdrawn_at`) e de outro ecossistema ficam de fora.
+3. Uma versão travada é **afetada** quando está dentro de `vulnerable_version_range` e não está corrigida por `patched_versions`. Qualquer versão afetada falha o check, com o GHSA, a gravidade, a faixa e a correção no log.
+
+As faixas são texto livre digitado pelos mantenedores, e os avisos do quinn usam formas diferentes. O script aceita as formas vistas e recusa o resto:
+
+| Forma | Leitura |
+| --- | --- |
+| `>= 0.11.0, <= 0.11.18` | vírgula junta restrições (sintaxe do GHSA, E) |
+| `0.11.17` ou `= 0.11.13` | versão exata |
+| `0.11.0 - 0.11.6` | faixa inclusiva |
+| `< 0.5.16, >= 0.6.0 < 0.6.3` | o E é vazio, então os grupos separados por vírgula são alternativas (OU), que é o que o aviso quis dizer |
+
+`patched_versions` lista a primeira versão corrigida de cada linha (`0.11.17`, `>= 0.11.19`, `0.9.5, 0.10.5`). Uma versão está corrigida quando está na correção da sua própria linha semver compatível ou acima dela, ou acima de todas as correções listadas. Assim, uma faixa que esqueceu o limite de cima (`> 0.7.0`, corrigido em `>= 0.11.18`) não acusa versões já corrigidas, e uma linha antiga sem correção própria continua afetada.
+
+Faixa ou versão que o script não entende (por exemplo `^0.5`) falha o check com o GHSA no log: na dúvida, ele nunca passa. Falha da API também falha o check.
+
+Para testar localmente: `GH_TOKEN=$(gh auth token) tools/repo-advisories/check.sh caminho/Cargo.lock quinn-rs/quinn quinn quinn-proto quinn-udp`.
+
 ### Limite conhecido: o caller pode ser trocado
 
 O ruleset só confere o nome do check, e o workflow que roda num PR é o do próprio PR. Um PR pode trocar o `ci.yml` por outro com jobs de mesmo nome que só passam. O portão protege `.github/`, mas quem roda é o portão do PR. Por isso, mudanças em `.github/` só entram com revisão atenta do Denilson.
@@ -152,8 +215,8 @@ Até existir o GitHub App dos agentes, também ficam como limite conhecido os co
 ### Segurança e custo
 
 - Nos checks de CI, permissões mínimas, todas de leitura: `contents: read` e, só no `human-gate`, `pull-requests: read` (arquivos, labels e eventos do PR) e `actions: read` (quando o head chegou). O caller precisa conceder as três. Nenhum segredo, nenhum `pull_request_target`, checkout sem credenciais persistidas.
-- Actions fixadas por SHA de commit, com a versão num comentário. Binários (gitleaks, kubeconform) fixados por versão e conferidos por SHA-256. OpenSpec fixado por lockfile, sem scripts de instalação.
-- Só roda em pull request, não em push na `main` (que só muda por PR). Jobs leves, com cache do cargo no `rust`.
+- Actions fixadas por SHA de commit, com a versão num comentário. Binários (gitleaks, cargo-deny, kubeconform) fixados por versão e conferidos por SHA-256. OpenSpec fixado por lockfile, sem scripts de instalação.
+- Roda em pull request, não em push na `main` (que só muda por PR), e uma vez por dia nos callers com `schedule`, só com o job `deny`. Jobs leves, com cache do cargo no `rust`. O `deny` não usa cache: baixa o índice e as crates do `cargo metadata` e o banco da RustSec a cada execução.
 
 ### Atualizar uma versão
 
