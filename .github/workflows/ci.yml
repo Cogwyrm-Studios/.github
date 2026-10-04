@@ -18,3 +18,18 @@ concurrency:
 jobs:
   ci:
     uses: ./.github/workflows/checks.yml
+
+  # Tests of tools/repo-advisories/check.sh against a fake GitHub API. Only
+  # here: the script is code of this repository, not of the callers.
+  advisory-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run the tests
+        run: tools/repo-advisories/test.sh

@@ -1,9 +1,14 @@
 # Reusable CI checks shared by every repository of the organization.
 #
-# Every job always runs and reports, so all repositories produce the same
-# check names (see README.md). A job whose check does not apply to the
-# repository (no openspec/, no Cargo.toml, not a pull request) passes after
-# a notice instead of being skipped.
+# On a pull request every job runs and reports, so all repositories produce
+# the same check names (see README.md). A job whose check does not apply to
+# the repository (no openspec/, no Cargo.toml) passes after a notice instead
+# of being skipped.
+#
+# On a scheduled run (the daily run of the callers) only `deny` and the
+# notice of `human-gate` run: advisories change without a commit, the other
+# checks do not. `gitleaks`, `openspec` and `rust` are skipped there;
+# schedules have no required checks.
 name: checks
 
 on:
@@ -27,12 +32,15 @@ permissions:
 env:
   GITLEAKS_VERSION: "8.30.1"
   GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+  CARGO_DENY_VERSION: "0.20.2"
+  CARGO_DENY_SHA256: "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f"
   OPENSPEC_VERSION: "1.13.2"
   NODE_VERSION: "22"
   APPROVAL_LABEL: human-approved
 
 jobs:
   gitleaks:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -58,6 +66,7 @@ jobs:
         run: '"$RUNNER_TEMP/gitleaks" git --redact --no-banner --exit-code 1 .'
 
   openspec:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -152,6 +161,9 @@ jobs:
             '.github/*' .gitleaks.toml .gitleaksignore
             # Secret encryption rules.
             .sops.yaml
+            # Supply chain policy: cargo-deny (licenses, bans, sources and
+            # ignored advisories) and the exceptions of the advisory step.
+            deny.toml advisory-exceptions.json
             # Authentication.
             'auth/*' '*/auth/*' 'oauth/*' '*/oauth/*'
             'authentication/*' '*/authentication/*' 'login/*' '*/login/*'
@@ -288,6 +300,7 @@ jobs:
           echo "Approved: '$APPROVAL_LABEL' applied by a human at $labeled_at, after the last change of the head or base at $pushed_at."
 
   rust:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -343,3 +356,105 @@ jobs:
         if: steps.detect.outputs.present == 'true'
         working-directory: ${{ inputs.rust-directory }}
         run: cargo test --locked
+
+  # Supply chain of Rust repositories (orrery#49-D2): cargo-deny with the
+  # deny.toml of the repository, plus the GHSA advisories that quinn-rs/quinn
+  # publishes in its own repository (most of them never reach RustSec, so
+  # cargo-deny does not see them). Both live in this one job so that a single
+  # required check, `ci / deny`, covers every advisory source; the quinn step
+  # runs even when cargo-deny fails, so one run reports both.
+  deny:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_DIR: ${{ inputs.rust-directory }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Detect Cargo.toml and deny.toml
+        id: detect
+        run: |
+          if [ ! -f "$RUST_DIR/Cargo.toml" ]; then
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No $RUST_DIR/Cargo.toml; nothing to check."
+            exit 0
+          fi
+          echo "present=true" >> "$GITHUB_OUTPUT"
+          if [ -f "$RUST_DIR/deny.toml" ]; then
+            echo "config=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "config=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The advisory script comes from this repository, like the OpenSpec
+      # lockfile: main for callers, the pull request head here.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        id: tools
+        if: steps.detect.outputs.present == 'true'
+        with:
+          repository: Cogwyrm-Studios/.github
+          ref: ${{ github.repository == 'Cogwyrm-Studios/.github' && github.event.pull_request.head.sha || 'main' }}
+          path: .cogwyrm-ci
+          sparse-checkout: tools/repo-advisories
+          persist-credentials: false
+
+      - name: Require deny.toml
+        if: steps.detect.outputs.present == 'true' && steps.detect.outputs.config != 'true'
+        run: |
+          echo "::error::$RUST_DIR/Cargo.toml exists but $RUST_DIR/deny.toml does not. Every Rust repository needs a cargo-deny policy (orrery#49-D2)."
+          exit 1
+
+      - name: Install cargo-deny
+        if: steps.detect.outputs.present == 'true'
+        run: |
+          set -euo pipefail
+          name="cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$name.tar.gz" \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/${name}.tar.gz"
+          echo "${CARGO_DENY_SHA256}  $RUNNER_TEMP/$name.tar.gz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/$name.tar.gz" -C "$RUNNER_TEMP" --strip-components=1 "$name/cargo-deny"
+          "$RUNNER_TEMP/cargo-deny" --version
+
+      # cargo-deny reads the crate graph through `cargo metadata`, so it needs
+      # the toolchain of the repository when there is a rust-toolchain.toml.
+      - name: Set up the toolchain
+        if: steps.detect.outputs.present == 'true'
+        working-directory: ${{ inputs.rust-directory }}
+        run: |
+          set -euo pipefail
+          if [ -f rust-toolchain.toml ] || [ -f rust-toolchain ]; then
+            rustup toolchain install
+          fi
+          cargo --version
+
+      # Every check blocks on an error. What counts as an error (yanked,
+      # unmaintained, duplicate versions...) is set in deny.toml, which is a
+      # protected path of the human gate.
+      - name: cargo deny check
+        if: steps.detect.outputs.present == 'true'
+        working-directory: ${{ inputs.rust-directory }}
+        run: '"$RUNNER_TEMP/cargo-deny" --locked --config deny.toml check advisories licenses bans sources'
+
+      # Fails when a locked quinn, quinn-proto or quinn-udp is affected by a
+      # published advisory, or when the answer cannot be trusted (see
+      # README.md). Without those crates in Cargo.lock the API is not called.
+      # MIN_ADVISORIES is the number published on 2026-10-04: advisories are
+      # withdrawn, never deleted, so fewer means a broken answer. Raise it
+      # when quinn publishes more.
+      - name: quinn security advisories
+        if: ${{ !cancelled() && steps.tools.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MIN_ADVISORIES: "13"
+        run: |
+          .cogwyrm-ci/tools/repo-advisories/check.sh \
+            --lock "$RUST_DIR/Cargo.lock" \
+            --repo quinn-rs/quinn \
+            --min-advisories "$MIN_ADVISORIES" \
+            --exceptions "$RUST_DIR/advisory-exceptions.json" \
+            quinn quinn-proto quinn-udp
