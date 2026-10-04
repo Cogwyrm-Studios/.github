@@ -1,6 +1,6 @@
 # .github
 
-Repositório de configuração da organização Cogwyrm Studios no GitHub. O perfil público da organização fica em [`profile/README.md`](profile/README.md), os formulários de issue em [`.github/ISSUE_TEMPLATE/`](.github/ISSUE_TEMPLATE/) e os workflows de CI reutilizáveis em [`.github/workflows/`](.github/workflows/).
+Repositório de configuração da organização Cogwyrm Studios no GitHub. O perfil público da organização fica em [`profile/README.md`](profile/README.md), o formulário de issue em [`.github/ISSUE_TEMPLATE/`](.github/ISSUE_TEMPLATE/) (só o PRD: toda issue é um PRD, [ADR 0025](https://github.com/Cogwyrm-Studios/handbook/blob/main/decisions/0025-toda-issue-e-um-prd.md), e issue em branco fica desligada) e os workflows de CI reutilizáveis em [`.github/workflows/`](.github/workflows/).
 
 ## CI reutilizável
 
