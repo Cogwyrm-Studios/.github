@@ -396,22 +396,34 @@ jobs:
           head_sha="$(jq -r '.head.sha' "$work/pr.json")"
           merge_base=""
 
-          # Line ranges ("first last ...") that a change must not touch in a
-          # Markdown file. The frontmatter runs from line 1 (when the first
-          # non-blank line is ---) to the first line that is exactly ---, or
-          # to the end. Claude Code runs a ```! block wherever it starts in a
-          # line and an inline !`command` across lines, so a file with a ```!
-          # (or ~~~!) anywhere, or with a !` not closed on its line, is one
-          # range from the first line to the last.
+          # Scans a Markdown file and prints "end sensitive whole lines":
+          # - end: last line of the frontmatter (0 without one). It runs from
+          #   line 1 (when the first non-blank line is ---) to the first line
+          #   that is exactly ---, or to the end of the file.
+          # - sensitive: 1 when a frontmatter line has hooks, mcpServers,
+          #   permissionMode or allowed-tools anywhere, a YAML hex escape, an
+          #   explicit key ("? "), an anchor or an alias.
+          # - whole: 1 when the file has a ```! (or ~~~!) anywhere or a !`
+          #   not closed on its line. Claude Code runs a ```! block wherever
+          #   it starts in a line and an inline !`command` across lines, so
+          #   any change in such a file counts.
           # shellcheck disable=SC2016 # awk program, not shell
-          ranges_awk='
+          scan_awk='
             { sub(/\r$/, "") }
             NR == 1 { sub(/^\357\273\277/, "") }
             fm == 0 && $0 !~ /^[ \t]*$/ {
               if ($0 ~ /^---[ \t]*$/) { fm = 1; next }
               fm = -1
             }
-            fm == 1 && $0 == "---" { printf "1 %d ", NR; fm = 2 }
+            fm == 1 && $0 == "---" { end = NR; fm = 2 }
+            fm == 1 {
+              l = tolower($0)
+              if (l ~ /(^|[^[:alnum:]_-])[^[:alnum:]_[:space:]:-]?(hooks|mcpservers|permissionmode|allowed-?tools)[^[:alnum:]_[:space:]:-]?[[:space:]]*:/ \
+                || l ~ /\\[xu][0-9a-f][0-9a-f]/ || l ~ /^[[:space:]]*\?([[:space:]]|$)/ \
+                || l ~ /(^|[[:space:]])&[[:alnum:]_.-]+([[:space:]]|$)/ \
+                || l ~ /^[[:space:]]*(-[[:space:]]+)?\*[^[:space:]]+[[:space:]]+:/ \
+                || l ~ /:[[:space:]]+\*[^[:space:]*]+[[:space:]]*$/) sensitive = 1
+            }
             index($0, "```!") || index($0, "~~~!") { whole = 1 }
             {
               rest = $0
@@ -421,7 +433,7 @@ jobs:
                 rest = substr(rest, index(rest, "`") + 1)
               }
             }
-            END { if (fm == 1) printf "1 %d ", NR; if (whole) printf "1 %d ", NR }'
+            END { if (fm == 1) end = NR; printf "%d %d %d %d\n", end, sensitive, whole, NR }'
           # Succeeds when an added line falls inside a range of "new" or a
           # removed line inside a range of "old".
           # shellcheck disable=SC2016 # awk program, not shell
@@ -441,14 +453,21 @@ jobs:
             /^\+/ { if (inside(n, new)) hit = 1; n++; next }
             { o++; n++ }
             END { exit !hit }'
-          # Prints the ranges of the file $2 at commit $1.
-          ranges_at() {
+          # Writes the file $2 at commit $1 to $3 (raw, up to 100 MB).
+          fetch_at() {
             local encoded
             encoded="$(jq -rn --arg p "$2" '$p | split("/") | map(@uri) | join("/")')"
             gh api -H 'Accept: application/vnd.github.raw+json' \
-              "repos/$REPO/contents/$encoded?ref=$1" > "$work/content" || return 1
-            awk "$ranges_awk" "$work/content"
+              "repos/$REPO/contents/$encoded?ref=$1" > "$3"
           }
+          find_merge_base() {
+            if [ -z "$merge_base" ]; then
+              merge_base="$(gh api "repos/$REPO/compare/$base_sha...$head_sha" --jq '.merge_base_commit.sha')" \
+                || fail "Could not find the merge base of the pull request."
+            fi
+          }
+          # A plugin.json change that only bumps the top-level "version".
+          version_line='^[+-][[:space:]]*"version"[[:space:]]*:[[:space:]]*"[0-9A-Za-z.+-]*"[[:space:]]*,?[[:space:]]*$'
 
           matches=()
           while IFS= read -r entry; do
@@ -462,6 +481,7 @@ jobs:
             # Renames also count their old path.
             mapfile -t paths < <(jq -r '.filename, (.previous_filename // empty)' <<< "$entry")
             matched=""
+            version_only=""
             for path in "${paths[@]}"; do
               for pattern in "${patterns[@]}"; do
                 if [[ "$pattern" == */* ]]; then
@@ -491,22 +511,44 @@ jobs:
                 fi
               fi
             fi
+            # plugin.json: a change whose added and removed lines all set
+            # "version" needs no label, if the files before and after are
+            # otherwise identical JSON (a "version" line inside dependencies
+            # changes more than the top level). Anything else, a missing diff
+            # or an unreadable file keeps it protected.
+            if [ -n "$matched" ] && [[ "$file" == .claude-plugin/plugin.json || "$file" == */.claude-plugin/plugin.json ]] \
+              && [ "$(jq -r '.status' <<< "$entry")" = modified ] && jq -e 'has("patch")' <<< "$entry" > /dev/null; then
+              patch="$(jq -r '.patch' <<< "$entry")"
+              changed="$(grep -E '^[+-]' <<< "$patch" || true)"
+              if [ -n "$changed" ] && ! grep -qvE "$version_line" <<< "$changed"; then
+                find_merge_base
+                if fetch_at "$merge_base" "$file" "$work/before.json" && fetch_at "$head_sha" "$file" "$work/after.json" \
+                  && before="$(jq -S 'if type == "object" then del(.version) else error("not an object") end' "$work/before.json")" \
+                  && after="$(jq -S 'if type == "object" then del(.version) else error("not an object") end' "$work/after.json")" \
+                  && [ "$before" = "$after" ]; then
+                  echo "Only the version changed in $file."
+                  matched=""
+                  version_only=1
+                fi
+              fi
+            fi
             # Claude Code skills, agents, commands and plugins. Every file
             # that is not Markdown under a .claude/ directory or a plugin
             # (plugins/<name>/) is protected: scripts that skills, hooks and
             # servers run live there. Markdown is inspected: the frontmatter
             # accepts hooks, mcpServers, permissionMode and allowed-tools,
             # and the body runs !`command` and ```! blocks. The file is
-            # protected when an added or removed line falls inside the
-            # frontmatter, or anywhere in a file that has a ```! or an
-            # unclosed !` (before or after the change), or anywhere has one
-            # of those keys, an inline command, a ```!,
-            # a YAML hex escape, an explicit key ("? ") or an anchor or alias.
+            # protected when an added or removed line has one of those keys,
+            # an inline command, a ```!, a YAML hex escape, an explicit key
+            # ("? "), an anchor or an alias; or falls inside the frontmatter
+            # when the frontmatter before or after the change is sensitive
+            # (see scan_awk); or falls anywhere in a file that has a ```! or
+            # an unclosed !` before or after the change.
             # A rename or copy protects the file, because the diff does not
             # show the frontmatter that moved. Without a diff (too large or
             # binary), or when the frontmatter cannot be read, the file
             # counts as protected.
-            if [ -z "$matched" ]; then
+            if [ -z "$matched" ] && [ -z "$version_only" ]; then
               for path in "${paths[@]}"; do
                 if [[ "$path" != .claude/* && "$path" != */.claude/* \
                   && "$path" != plugins/*/* && "$path" != */plugins/*/* ]]; then
@@ -529,17 +571,27 @@ jobs:
                     -e '^[+-].*:[[:space:]]+\*[^[:space:]*]+[[:space:]]*$' <<< "$patch"; then
                     matched="$path (Claude Code frontmatter key, inline command, YAML escape, anchor or alias changed)"
                   else
-                    if [ -z "$merge_base" ]; then
-                      merge_base="$(gh api "repos/$REPO/compare/$base_sha...$head_sha" --jq '.merge_base_commit.sha')" \
-                        || fail "Could not find the merge base of the pull request."
-                    fi
+                    find_merge_base
                     status="$(jq -r '.status' <<< "$entry")"
-                    old_ranges=""
-                    new_ranges=""
-                    if { [ "$status" = added ] || old_ranges="$(ranges_at "$merge_base" "$path")"; } \
-                      && { [ "$status" = removed ] || new_ranges="$(ranges_at "$head_sha" "$path")"; }; then
+                    old_scan="0 0 0 0"
+                    new_scan="0 0 0 0"
+                    if { [ "$status" = added ] || { fetch_at "$merge_base" "$path" "$work/content" \
+                        && old_scan="$(awk "$scan_awk" "$work/content")"; }; } \
+                      && { [ "$status" = removed ] || { fetch_at "$head_sha" "$path" "$work/content" \
+                        && new_scan="$(awk "$scan_awk" "$work/content")"; }; }; then
+                      read -r old_end old_sensitive old_whole old_lines <<< "$old_scan"
+                      read -r new_end new_sensitive new_whole new_lines <<< "$new_scan"
+                      # The frontmatter counts when either side is sensitive.
+                      old_ranges=""
+                      new_ranges=""
+                      if [ "$old_sensitive" = 1 ] || [ "$new_sensitive" = 1 ]; then
+                        if [ "$old_end" -gt 0 ]; then old_ranges="1 $old_end"; fi
+                        if [ "$new_end" -gt 0 ]; then new_ranges="1 $new_end"; fi
+                      fi
+                      if [ "$old_whole" = 1 ]; then old_ranges="$old_ranges 1 $old_lines"; fi
+                      if [ "$new_whole" = 1 ]; then new_ranges="$new_ranges 1 $new_lines"; fi
                       if awk -v old="$old_ranges" -v new="$new_ranges" "$hunks_awk" <<< "$patch"; then
-                        matched="$path (Claude Code frontmatter or file with commands changed)"
+                        matched="$path (Claude Code frontmatter with sensitive keys or file with commands changed)"
                       fi
                     else
                       matched="$path (Claude Code instructions could not be read)"
