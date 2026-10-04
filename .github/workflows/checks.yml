@@ -397,56 +397,69 @@ jobs:
           merge_base=""
 
           # Scans a Markdown file and prints "end sensitive whole lines":
-          # - end: last line of the frontmatter (0 without one). It runs from
-          #   line 1 (when the first non-blank line is ---) to the first line
-          #   that is exactly ---, or to the end of the file.
+          # - end: last line of the frontmatter (0 without one). It starts
+          #   when the first non-blank line (after a BOM) starts with ---,
+          #   whatever follows on that line (JavaScript's \s, used by Claude
+          #   Code, also matches NBSP, \v and \f), and runs to the first
+          #   line that is exactly ---, or to the end of the file.
           # - sensitive: 0 only for a frontmatter on the allowlist; anything
           #   in doubt is 1. Claude Code reads the frontmatter with a full
           #   YAML parser (flow keys across lines, quoted keys continued
           #   with \, anchors with any character), so the frontmatter must
           #   be plain block YAML: every non-blank line is a "key: value" at
-          #   the top level, with an allowed key, or an indented line that
-          #   continues the value before it; no tab, \, &, *, !, %, "? ",
-          #   no { or [ left open on its line, no "..." line, no unclosed
-          #   frontmatter. Its whole text, letters only and lowercase, must
-          #   not contain a word of the sensitive list.
+          #   the top level, with an allowed key, or an indented line (a
+          #   nested key, when the line before has no value, or a
+          #   continuation of the value before it); no tab, \v, \f, NBSP,
+          #   NEL, U+2028, U+2029, \, &, *, !, %, "? ", no { or [ left open
+          #   on its line, no "..." line, no unclosed frontmatter. No key
+          #   name at any depth (plain or quoted), and no line with { or [,
+          #   may contain a sensitive word once lowercased and reduced to
+          #   letters.
           # - whole: 1 when the file has a ```! (or ~~~!) anywhere or a !`
-          #   (at the start or after a space or tab) not closed on its line. Claude Code runs a ```! block wherever
-          #   it starts in a line and an inline !`command` across lines, so
-          #   any change in such a file counts.
+          #   (at the start or after a space or tab) not closed on its line.
+          #   Claude Code runs a ```! block wherever it starts in a line and
+          #   an inline !`command` across lines, so any change in such a
+          #   file counts.
           # shellcheck disable=SC2016 # awk program, not shell
           scan_awk='
+            function has_word(t,   i) {
+              t = tolower(t)
+              gsub(/[^a-z]/, "", t)
+              for (i = 1; i <= nwords; i++) if (index(t, words[i])) return 1
+              return 0
+            }
             BEGIN {
               split("name description model license compatibility metadata argument-hint when_to_use color effort version tools disallowed-tools user-invocable disable-model-invocation generatedBy category tags", list, " ")
               for (i in list) allowed[list[i]] = 1
-              words = "hooks mcpservers permissionmode allowedtools lspservers monitors settings dependencies agents shell context userconfig"
+              nwords = split("hooks mcpservers permissionmode allowedtools lspservers monitors settings dependencies agents shell context userconfig", words, " ")
             }
             { sub(/\r$/, "") }
             NR == 1 { sub(/^\357\273\277/, "") }
             fm == 0 && $0 !~ /^[ \t]*$/ {
-              if ($0 ~ /^---[ \t]*$/) { fm = 1; next }
+              if ($0 ~ /^---/) { fm = 1; next }
               fm = -1
             }
             fm == 1 && $0 == "---" { end = NR; fm = 2 }
-            fm == 1 {
-              text = text " " $0
-              if ($0 ~ /^[ ]*$/) { }
-              else if ($0 ~ /[\t\\&*!%]/ || $0 ~ /^[ ]*\?([ ]|$)/ || $0 ~ /^\.\.\.[ ]*$/) sensitive = 1
-              else {
-                line = $0
-                opened = gsub(/[[{]/, "", line)
-                line = $0
-                closed = gsub(/[]}]/, "", line)
-                if (opened != closed) sensitive = 1
-                if ($0 ~ /^ /) {
-                  if (!seen) sensitive = 1
-                } else if (match($0, /^[A-Za-z0-9_-]+:( |$)/)) {
-                  seen = 1
-                  key = substr($0, 1, RLENGTH)
-                  sub(/:[ ]*$/, "", key)
-                  if (!(key in allowed)) sensitive = 1
-                } else sensitive = 1
-              }
+            fm == 1 && $0 !~ /^[ ]*$/ {
+              if ($0 ~ /[\t\v\f\\&*!%]/ || $0 ~ /\302\240|\302\205|\342\200\250|\342\200\251/ \
+                || $0 ~ /^[ ]*\?([ ]|$)/ || $0 ~ /^\.\.\.[ ]*$/) sensitive = 1
+              line = $0
+              opened = gsub(/[[{]/, "", line)
+              line = $0
+              closed = gsub(/[]}]/, "", line)
+              if (opened != closed) sensitive = 1
+              if (opened && has_word($0)) sensitive = 1
+              is_key = match($0, /^[ ]*([A-Za-z0-9_-]+|"[^"]*"|\047[^\047]*\047)[ ]*:( |$)/)
+              if (is_key && has_word(substr($0, RSTART, RLENGTH))) sensitive = 1
+              if ($0 ~ /^ /) {
+                if (!seen || (expect_key && !is_key)) sensitive = 1
+              } else if (match($0, /^[A-Za-z0-9_-]+:( |$)/)) {
+                seen = 1
+                key = substr($0, 1, RLENGTH)
+                sub(/:[ ]*$/, "", key)
+                if (!(key in allowed)) sensitive = 1
+              } else sensitive = 1
+              expect_key = ($0 ~ /:[ ]*$/)
             }
             index($0, "```!") || index($0, "~~~!") { whole = 1 }
             {
@@ -463,12 +476,6 @@ jobs:
             }
             END {
               if (fm == 1) { end = NR; sensitive = 1 }
-              if (end) {
-                text = tolower(text)
-                gsub(/[^a-z]/, "", text)
-                n = split(words, w, " ")
-                for (i = 1; i <= n; i++) if (index(text, w[i])) sensitive = 1
-              }
               printf "%d %d %d %d\n", end, sensitive, whole, NR
             }'
           # Succeeds when an added line falls inside a range of "new" or a
