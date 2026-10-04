@@ -410,13 +410,14 @@ jobs:
           #   the top level, with an allowed key, or an indented line (a
           #   nested key, when the line before has no value, or a
           #   continuation of the value before it); no tab, \v, \f, NBSP,
-          #   NEL, U+2028, U+2029, \, &, *, !, %, "? ", no { or [ left open
+          #   NEL, U+2028, U+2029, CR, \, &, *, !, %, "? ", no { or [ left open
           #   on its line, no "..." line, no unclosed frontmatter. No key
           #   name at any depth (plain or quoted), and no line with { or [,
           #   may contain a sensitive word once lowercased and reduced to
           #   letters.
-          # - whole: 1 when the file has a ```! (or ~~~!) anywhere or a !`
-          #   (at the start or after a space or tab) not closed on its line.
+          # - whole: 1 when the file has a ```! (or ~~~!) anywhere, a CR
+          #   that does not end a line, or a !` (at the start or after
+          #   whitespace) not closed on its line.
           #   Claude Code runs a ```! block wherever it starts in a line and
           #   an inline !`command` across lines, so any change in such a
           #   file counts.
@@ -431,17 +432,34 @@ jobs:
             BEGIN {
               split("name description model license compatibility metadata argument-hint when_to_use color effort version tools disallowed-tools user-invocable disable-model-invocation generatedBy category tags", list, " ")
               for (i in list) allowed[list[i]] = 1
-              nwords = split("hooks mcpservers permissionmode allowedtools lspservers monitors settings dependencies agents shell context userconfig", words, " ")
+              nwords = split("hooks mcpservers permissionmode allowedtools lspservers monitors settings dependencies agent shell context userconfig", words, " ")
             }
             { sub(/\r$/, "") }
             NR == 1 { sub(/^\357\273\277/, "") }
+            # A lone CR is a line break for the YAML parser of Claude Code,
+            # but not for awk nor for the patch.
+            index($0, "\r") { whole = 1 }
+            index($0, "```!") || index($0, "~~~!") { whole = 1 }
+            {
+              # A !` at the start or after whitespace, as JavaScript \s
+              # (any character other than printable ASCII counts).
+              pos = 1
+              while ((i = index(substr($0, pos), "!`")) > 0) {
+                at = pos + i - 1
+                pos = at + 2
+                if (at > 1 && substr($0, at - 1, 1) ~ /[!-~]/) continue
+                j = index(substr($0, pos), "`")
+                if (j == 0) { whole = 1; break }
+                if (j > 1) pos += j
+              }
+            }
             fm == 0 && $0 !~ /^[ \t]*$/ {
               if ($0 ~ /^---/) { fm = 1; next }
               fm = -1
             }
             fm == 1 && $0 == "---" { end = NR; fm = 2 }
             fm == 1 && $0 !~ /^[ ]*$/ {
-              if ($0 ~ /[\t\v\f\\&*!%]/ || $0 ~ /\302\240|\302\205|\342\200\250|\342\200\251/ \
+              if ($0 ~ /[\t\v\f\r\\&*!%]/ || $0 ~ /\302\240|\302\205|\342\200\250|\342\200\251/ \
                 || $0 ~ /^[ ]*\?([ ]|$)/ || $0 ~ /^\.\.\.[ ]*$/) sensitive = 1
               line = $0
               opened = gsub(/[[{]/, "", line)
@@ -460,19 +478,6 @@ jobs:
                 if (!(key in allowed)) sensitive = 1
               } else sensitive = 1
               expect_key = ($0 ~ /:[ ]*$/)
-            }
-            index($0, "```!") || index($0, "~~~!") { whole = 1 }
-            {
-              # Like the parser: a !` at the start or after a space or tab.
-              pos = 1
-              while ((i = index(substr($0, pos), "!`")) > 0) {
-                at = pos + i - 1
-                pos = at + 2
-                if (at > 1 && substr($0, at - 1, 1) != " " && substr($0, at - 1, 1) != "\t") continue
-                j = index(substr($0, pos), "`")
-                if (j == 0) { whole = 1; break }
-                if (j > 1) pos += j
-              }
             }
             END {
               if (fm == 1) { end = NR; sensitive = 1 }
@@ -607,8 +612,8 @@ jobs:
                 else
                   patch="$(jq -r '.patch' <<< "$entry")"
                   if grep -qiE \
-                    -e "^[+-](.*[^[:alnum:]_-])?[\"']?(hooks|mcpServers|permissionMode|allowed-?tools)[\"']?[[:space:]]*:" \
-                    -e '^[+-](.*[[:space:]])?!`' -e '^[+-].*(```|~~~)!' \
+                    -e "^[+-](.*[^[:alnum:]_-])?[\"']?(hooks|mcp_?servers|permission_?mode|allowed[-_]?tools|lsp_?servers|monitors|settings|dependencies|agents?|shell|context|user_?config)[\"']?[[:space:]]*:" \
+                    -e '^[+-](.*[^!-~])?!`' -e '^[+-].*(```|~~~)!' \
                     -e '^[+-].*\\[xu][[:xdigit:]]{2}' -e '^[+-][[:space:]]*\?([[:space:]]|$)' \
                     -e '^[+-](.*[[:space:]])?&[[:alnum:]_.-]+([[:space:]]|$)' \
                     -e '^[+-][[:space:]]*(-[[:space:]]+)?\*[^[:space:]]+[[:space:]]+:' \
