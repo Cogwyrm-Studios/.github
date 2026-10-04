@@ -1,21 +1,30 @@
 #!/usr/bin/env bash
-# Checks the versions locked in a Cargo.lock against the published security
-# advisories of a GitHub repository (GHSA published by the maintainers).
+# Checks the versions locked in a Cargo.lock against the security advisories
+# that a GitHub repository publishes itself (repository GHSA).
 #
 # Why: cargo-deny only reads the RustSec database, and some upstreams publish
-# GHSA advisories that never reach RustSec or the global GitHub Advisory
-# Database (quinn-rs/quinn, orrery#49-D2).
+# advisories that never reach RustSec or the global GitHub Advisory Database
+# (quinn-rs/quinn, orrery#49-D2).
 #
-# Usage: check.sh <Cargo.lock> <owner/repo> <crate>...
-#   GH_TOKEN  optional token for the GitHub API. If the API refuses it, the
-#             request is repeated without authentication.
+# Usage:
+#   check.sh --lock <Cargo.lock> --repo <owner/repo> --min-advisories <n>
+#            [--exceptions <advisory-exceptions.json>] <crate>...
 #
-# Exit codes: 0 no locked version is affected (or none of the crates is in
-# the lockfile, in which case the API is not called); 1 at least one locked
-# version is affected; 2 error (API, unparsable range or version). Anything
-# ambiguous fails; it never passes by default.
+#   GH_TOKEN  optional token for the GitHub API. If the API refuses it (401,
+#             403 or 404), the request is repeated without authentication.
 #
-# Only bash, curl, awk and jq (1.7 or newer), all present on ubuntu-24.04.
+# Exit codes:
+#   0  no locked version is affected, or none of the crates is in the
+#      lockfile (then the API is not called);
+#   1  a locked version is affected;
+#   2  the answer cannot be trusted: API failure, fewer advisories than
+#      --min-advisories, an advisory without a usable Rust entry, a range or
+#      fix the parser refuses, a version inside the range with no fix for its
+#      own release line, or an invalid, expired or unused exception.
+# Every finding except API, count and file errors can be accepted by a
+# reviewed exception (see README.md). Nothing ambiguous passes by default.
+#
+# Only bash, curl, awk, date and jq (1.7 or newer), all on ubuntu-24.04.
 set -euo pipefail
 
 API="${GITHUB_API_URL:-https://api.github.com}"
@@ -25,15 +34,41 @@ die() {
   exit 2
 }
 
-[ "$#" -ge 3 ] || die "usage: check.sh <Cargo.lock> <owner/repo> <crate>..."
-lockfile="$1"
-repo="$2"
-shift 2
+lockfile=""
+repo=""
+min_advisories=""
+exceptions_file=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --lock) lockfile="${2:-}"; shift 2 ;;
+    --repo) repo="${2:-}"; shift 2 ;;
+    --min-advisories) min_advisories="${2:-}"; shift 2 ;;
+    --exceptions) exceptions_file="${2:-}"; shift 2 ;;
+    --) shift; break ;;
+    -*) die "Unknown option: $1" ;;
+    *) break ;;
+  esac
+done
+[ "$#" -ge 1 ] && [ -n "$lockfile" ] && [ -n "$repo" ] && [ -n "$min_advisories" ] \
+  || die "usage: check.sh --lock <Cargo.lock> --repo <owner/repo> --min-advisories <n> [--exceptions <file>] <crate>..."
 [ -f "$lockfile" ] || die "$lockfile not found."
 [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "Invalid repository: $repo"
+[[ "$min_advisories" =~ ^[0-9]+$ ]] || die "Invalid --min-advisories: $min_advisories"
+for crate in "$@"; do
+  [[ "$crate" =~ ^[A-Za-z0-9_-]+$ ]] || die "Invalid crate name: $crate"
+done
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
+
+# Exceptions of the consumer repository. A missing file means no exception.
+if [ -n "$exceptions_file" ] && [ -f "$exceptions_file" ]; then
+  jq -e 'type == "object"' "$exceptions_file" > /dev/null 2>&1 \
+    || die "$exceptions_file is not a JSON object."
+  cp "$exceptions_file" "$work/exceptions.json"
+else
+  echo '{"exceptions": []}' > "$work/exceptions.json"
+fi
 
 # name<TAB>version of every package of the lockfile with one of the names.
 awk -v names="$*" '
@@ -47,18 +82,22 @@ awk -v names="$*" '
 ' "$lockfile" | sort -u > "$work/locked.tsv"
 
 if [ ! -s "$work/locked.tsv" ]; then
+  if [ "$(jq '.exceptions | length? // 0' "$work/exceptions.json")" != 0 ]; then
+    die "None of $* is in $lockfile, but $exceptions_file has exceptions. Remove them."
+  fi
   echo "::notice::None of $* is in $lockfile; $repo advisories not checked."
   exit 0
 fi
 echo "Locked versions:"
 sed 's/\t/ /; s/^/  /' "$work/locked.tsv"
 
-# All published advisories, following the cursor of the Link header.
+# Every published advisory (withdrawn ones included), following the cursor
+# of the Link header.
 fetch() {
   local url="$API/repos/$repo/security-advisories?state=published&per_page=100"
   local use_token=""
   [ -n "${GH_TOKEN:-}" ] && use_token=1
-  local page=0 status next
+  local page=0 status
   : > "$work/advisories.jsonl"
   while [ -n "$url" ]; do
     page=$((page + 1))
@@ -77,51 +116,76 @@ fetch() {
       status="$(curl "${args[@]}" "$url")" || status=000
     fi
     [ "$status" = 200 ] || die "Could not read the security advisories of $repo (HTTP $status)."
-    jq -e 'type == "array"' "$work/body.json" > /dev/null \
+    jq -e 'type == "array"' "$work/body.json" > /dev/null 2>&1 \
       || die "Unexpected answer for the security advisories of $repo."
     jq -c '.[]' "$work/body.json" >> "$work/advisories.jsonl"
-    next="$(tr -d '\r' < "$work/headers.txt" \
+    url="$(tr -d '\r' < "$work/headers.txt" \
       | sed -n 's/^[Ll]ink:.*<\([^>]*\)>; *rel="next".*/\1/p' | head -n 1)"
-    url="$next"
   done
 }
 fetch
-echo "Published advisories of $repo: $(wc -l < "$work/advisories.jsonl")"
+count="$(wc -l < "$work/advisories.jsonl")"
+echo "Published advisories of $repo: $count"
+# Advisories are never deleted, only withdrawn, so fewer than the known
+# number means a broken answer (or a token that sees less), not good news.
+[ "$count" -ge "$min_advisories" ] \
+  || die "Only $count published advisories from $repo, fewer than the $min_advisories known. Refusing to trust the answer."
 
-# Range semantics. The ranges are free text typed by the maintainers, so the
-# parser accepts the forms seen in practice and refuses anything else:
-#   ">= 0.11.0, <= 0.11.18"   comma joins constraints (GHSA syntax, AND)
-#   "0.11.17" / "= 0.11.13"   exact version
-#   "0.11.0 - 0.11.6"         inclusive range
-#   "< 0.5.16, >= 0.6.0 < 0.6.3"
-#                             AND is empty, so the comma groups are read as
-#                             alternatives (OR), which is what was meant
-# patched_versions lists the first fixed version of each release line
-# ("0.11.17", ">= 0.11.19", "0.9.5, 0.10.5"). A locked version is patched when
-# it is at or above the fix of its own semver-compatible line, or at or above
-# every listed fix. Affected = inside the range and not patched, so a range
-# that forgets its upper bound ("> 0.7.0") does not flag fixed versions.
-jq -n -r --rawfile locked "$work/locked.tsv" --arg repo "$repo" '
+# Rules (README.md, "Avisos de segurança do quinn"):
+# - Ranges and fixes are free text typed by the maintainers. Accepted forms:
+#   ">= 0.11.0, <= 0.11.18" (comma = AND), "0.11.17" or "= 0.11.13" (exact),
+#   "0.11.0 - 0.11.6" (inclusive). When the AND of every comma group is empty
+#   ("< 0.5.16, >= 0.6.0 < 0.6.3"), the groups are alternatives (OR).
+#   Pre-releases and build metadata are refused. A partial version is padded
+#   with zeros only after "<" or ">=", where padding is exact; anywhere else
+#   ("= 0.11", "0.11", "<= 0.11", "> 0.11") it is refused.
+# - patched_versions lists the first fixed version of each release line
+#   (semver-compatible: same major, or same minor under 0.x).
+# - A locked version is AFFECTED when it is inside the range, or below the
+#   fix listed for its own line. It is clean when it is at or above the fix
+#   of its own line, or outside the range with no fix for its line. Inside
+#   the range with fixes listed only for other lines it is UNRESOLVED: a new
+#   line (say 0.12) under an open range ("> 0.7.0") needs a reviewed
+#   exception, because the advisory does not say whether it is fixed.
+jq -n -r \
+  --rawfile locked "$work/locked.tsv" \
+  --slurpfile exfile "$work/exceptions.json" \
+  --arg today "$(date -u +%Y-%m-%d)" \
+  --arg repo "$repo" '
   def trim: gsub("^\\s+|\\s+$"; "");
-  # [major, minor, patch, release]: a pre-release sorts before its release.
-  def ver:
-    (capture("^v?(?<a>[0-9]+)(\\.(?<b>[0-9]+))?(\\.(?<c>[0-9]+))?(-(?<pre>[0-9A-Za-z.-]+))?(\\+[0-9A-Za-z.-]+)?$")
-      // error("unparsable version \"\(.)\""))
-    | [(.a | tonumber), ((.b // "0") | tonumber), ((.c // "0") | tonumber), (if .pre then 0 else 1 end)];
+  # Locked version: [major, minor, patch, release]; a pre-release sorts
+  # before its release.
+  def lver:
+    (capture("^(?<a>[0-9]+)\\.(?<b>[0-9]+)\\.(?<c>[0-9]+)(-(?<pre>[0-9A-Za-z.-]+))?(\\+[0-9A-Za-z.-]+)?$")
+      // error("unparsable locked version \"\(.)\""))
+    | [(.a | tonumber), (.b | tonumber), (.c | tonumber), (if .pre then 0 else 1 end)];
+  # Version of a range or fix, after the operator $op.
+  def cver($op):
+    . as $text
+    | if test("[-+]") then error("pre-release or build metadata in \"\($text)\" is not supported") else . end
+    | (capture("^v?(?<a>[0-9]+)(\\.(?<b>[0-9]+))?(\\.(?<c>[0-9]+))?$")
+        // error("unparsable version \"\($text)\""))
+    | if (.c == null) and ($op != "<" and $op != ">=")
+      then error("partial version \"\($text)\" after \"\(if $op == "=" then "= or no operator" else $op end)\" is ambiguous")
+      else . end
+    | [(.a | tonumber), ((.b // "0") | tonumber), ((.c // "0") | tonumber), 1];
   def line: if .[0] > 0 then [.[0]] elif .[1] > 0 then [0, .[1]] else [0, 0, .[2]] end;
+  def show: "\(.[0]).\(.[1]).\(.[2])";
   def ok($v):
     if .op == ">=" then $v >= .v elif .op == ">" then $v > .v
     elif .op == "<=" then $v <= .v elif .op == "<" then $v < .v
     else $v == .v end;
   def all_ok($v): all(.[]; ok($v));
-  # Constraints of one comma group.
+  # Constraints of one comma group. Tokens are taken greedily, so anything
+  # odd ends up inside a version and is refused by cver.
   def group:
     . as $text
     | gsub("(?<x>v?[0-9][0-9A-Za-z.+]*)\\s+-\\s+(?<y>v?[0-9])"; ">= \(.x) <= \(.y)")
     | if gsub("(>=|<=|==|>|<|=)?\\s*v?[0-9][0-9A-Za-z.+-]*"; "") | test("^\\s*$") | not
       then error("unparsable range \"\($text)\"") else . end
     | [scan("(>=|<=|==|>|<|=)?\\s*(v?[0-9][0-9A-Za-z.+-]*)")
-       | {op: ((.[0] // "=") | if . == "==" then "=" else . end), v: (.[1] | ver)}];
+       | ((.[0] // "=") | if . == "==" then "=" else . end) as $op
+       | {op: $op, v: (.[1] | cver($op))}];
   # Whether some version satisfies every constraint. The order is discrete,
   # so a non-empty interval always holds one of these candidates.
   def satisfiable:
@@ -137,29 +201,93 @@ jq -n -r --rawfile locked "$work/locked.tsv" --arg repo "$repo" '
       | if ($all | satisfiable) then ($all | all_ok($v))
         else any($groups[]; all_ok($v)) end
     end;
-  def patched($v):
-    if . == null or (trim == "") then false
+  def fixes:
+    if . == null or (trim == "") then []
     else [split(",")[] | trim | select(. != "")
-          | (capture("^(>=)?\\s*(?<x>v?[0-9][0-9A-Za-z.+-]*)$")
-             // error("unparsable patched version \"\(.)\"")) | .x | ver] as $fixes
-      | any($fixes[]; (line == ($v | line)) and $v >= .) or ($v >= ($fixes | max))
+          | (capture("^(?<op>>=)?\\s*(?<x>\\S+)$") // error("unparsable fix \"\(.)\""))
+          | (if .op then ">=" else "=" end) as $op | .x | cver($op)]
     end;
+  def usable: (.package | type) == "object" and .package.ecosystem == "rust"
+    and (.package.name | type) == "string" and .package.name != "";
+  def key($a; $c; $v): {advisory: $a, crate: $c, version: $v};
 
   [$locked | split("\n")[] | select(. != "") | split("\t") | {name: .[0], version: .[1]}] as $pkgs
-  | [inputs] as $advisories
-  | [ $advisories[] | select(.withdrawn_at == null) as $a
-      | $a.vulnerabilities[]?
-      | select((.package.ecosystem // "" | ascii_downcase) == "rust") as $vuln
-      | $pkgs[] | select(.name == $vuln.package.name) as $pkg
-      | try (
-          ($pkg.version | ver) as $v
-          | if ($vuln.vulnerable_version_range | in_range($v))
-               and (($vuln.patched_versions | patched($v)) | not)
-            then ["AFFECTED", "\($pkg.name) \($pkg.version) is affected by \($a.ghsa_id) (\($a.severity // "unknown")): \($a.summary). Vulnerable: \($vuln.vulnerable_version_range // "all"); patched: \($vuln.patched_versions // "none"). \($a.html_url)"]
-            else empty end
-        ) catch ["ERROR", "\($a.ghsa_id) for \($pkg.name) \($pkg.version): \(.)"]
-    ]
-  | .[]
+  | [inputs | select(.withdrawn_at == null)] as $advisories
+
+  # Findings: {key, kind, message}.
+  | [ $advisories[] | . as $a | ($a.ghsa_id // "advisory without ghsa_id") as $id
+      | if ($a.vulnerabilities | type) != "array" or ($a.vulnerabilities | length) == 0 then
+          {key: key($id; null; null), kind: "ERROR",
+           message: "\($id) has no vulnerable package listed. \($a.html_url // "")"}
+        elif any($a.vulnerabilities[]; usable | not) then
+          {key: key($id; null; null), kind: "ERROR",
+           message: "\($id) lists a package that is not a Rust crate (ecosystem must be \"rust\"): \([$a.vulnerabilities[] | "\(.package.ecosystem // "null"):\(.package.name // "null")"] | join(", ")). \($a.html_url // "")"}
+        else
+          $a.vulnerabilities[] as $vuln
+          | $pkgs[] | select(.name == $vuln.package.name) as $pkg
+          | key($id; $pkg.name; $pkg.version) as $k
+          | try (
+              ($pkg.version | lver) as $v
+              | ($vuln.vulnerable_version_range | in_range($v)) as $inr
+              | ($vuln.patched_versions | fixes) as $fixes
+              | [$fixes[] | select(line == ($v | line))] as $own
+              | "\($pkg.name) \($pkg.version), \($id) (\($a.severity // "unknown")): \($a.summary // ""). Vulnerable: \($vuln.vulnerable_version_range // "all"); patched: \($vuln.patched_versions // "none"). \($a.html_url // "")" as $about
+              | if ($own | length) > 1 then
+                  error("several fixes listed for the line of \($pkg.version)")
+                elif ($own | length) == 1 then
+                  if $v < $own[0] then {key: $k, kind: "AFFECTED", message: "Affected (below the fix \($own[0] | show) of its line): \($about)"}
+                  else empty end
+                elif $inr then
+                  if $fixes == [] then {key: $k, kind: "AFFECTED", message: "Affected (no fix published): \($about)"}
+                  else {key: $k, kind: "UNRESOLVED", message: "Inside the range, and no fix is listed for its line; needs a reviewed exception or an update: \($about)"} end
+                else empty end
+            ) catch {key: $k, kind: "ERROR", message: "Cannot evaluate \($id) for \($pkg.name) \($pkg.version): \(.)"}
+        end
+    ] as $findings
+
+  # Exceptions: {advisory, crate, version, reason, review-by}; crate and
+  # version are both present (one locked package) or both absent (an
+  # advisory-level finding).
+  | ($exfile[0]) as $file
+  | (if ($file | has("exceptions") | not) or ($file.exceptions | type) != "array"
+         or ($file | keys) != ["exceptions"]
+     then [{bad: "the file must be {\"exceptions\": [...]} and nothing else"}]
+     else [$file.exceptions | to_entries[] | .key as $i | .value
+       | if type != "object" then {bad: "entry \($i) is not an object"}
+         elif (keys - ["advisory", "crate", "version", "reason", "review-by"]) != [] then
+           {bad: "entry \($i) has unknown keys \(keys - ["advisory", "crate", "version", "reason", "review-by"])"}
+         elif ((.advisory | type) != "string") or (.advisory | test("^GHSA(-[23456789cfghjmpqrvwx]{4}){3}$") | not) then
+           {bad: "entry \($i) needs \"advisory\": a GHSA id"}
+         elif ((.reason | type) != "string") or ((.reason | trim | length) < 10) then
+           {bad: "entry \($i) (\(.advisory)) needs a \"reason\""}
+         elif ((has("crate")) != (has("version"))) then
+           {bad: "entry \($i) (\(.advisory)) needs both \"crate\" and \"version\", or neither"}
+         elif has("crate") and (((.crate | type) != "string") or ((.version | type) != "string")) then
+           {bad: "entry \($i) (\(.advisory)): \"crate\" and \"version\" are strings"}
+         elif ((."review-by" | type) != "string")
+              or ((."review-by" | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}$")) | not)
+              or ((try (."review-by" | strptime("%Y-%m-%d") | mktime | strftime("%Y-%m-%d")) catch "") != ."review-by") then
+           {bad: "entry \($i) (\(.advisory)) needs \"review-by\" as a valid YYYY-MM-DD date"}
+         else
+           {key: key(.advisory; .crate; .version), reason, review: ."review-by",
+            expired: (."review-by" < $today)}
+         end]
+     end) as $exceptions
+  | ([$exceptions[] | select(has("key")) | .key] | group_by(.) | map(select(length > 1) | .[0])) as $dups
+  | [$exceptions[] | select(has("key") and (.expired | not))] as $valid
+
+  | ( $findings[]
+      | . as $f
+      | [$valid[] | select(.key == $f.key)][0] as $ex
+      | if $ex then ["EXCEPTED", "\($f.kind) accepted by the exception (\($ex.reason); review by \($ex.review)): \($f.message)"]
+        else [$f.kind, $f.message] end
+    ),
+    ( $exceptions[] | select(has("bad")) | ["BADEXC", "Invalid exception: \(.bad)."] ),
+    ( $dups[] | ["BADEXC", "Duplicate exception for \(.advisory) \(.crate // "") \(.version // "")."] ),
+    ( $exceptions[] | select(has("key") and .expired)
+      | ["BADEXC", "Expired exception for \(.key.advisory) \(.key.crate // "") \(.key.version // "") (review by \(.review), today is \($today)). Review it again or update the crate."] ),
+    ( $valid[] | . as $e | select(all($findings[]; .key != $e.key))
+      | ["BADEXC", "Unused exception for \(.key.advisory) \(.key.crate // "") \(.key.version // ""): no finding matches it. Remove it."] )
   | "\(.[0])\t\(.[1] | gsub("[\\t\\r\\n]+"; " "))"
 ' "$work/advisories.jsonl" > "$work/findings.tsv" || die "Could not evaluate the advisories of $repo."
 
@@ -170,8 +298,15 @@ while IFS=$'\t' read -r kind message; do
       echo "::error::$message"
       [ "$status" -eq 2 ] || status=1
       ;;
-    ERROR)
-      echo "::error::Cannot evaluate $message. Fix the parser or review by hand."
+    UNRESOLVED | ERROR | BADEXC)
+      echo "::error::$message"
+      status=2
+      ;;
+    EXCEPTED)
+      echo "::warning::$message"
+      ;;
+    *)
+      echo "::error::Unexpected output: $kind $message"
       status=2
       ;;
   esac

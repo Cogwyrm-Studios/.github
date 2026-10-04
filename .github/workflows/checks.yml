@@ -1,13 +1,14 @@
 # Reusable CI checks shared by every repository of the organization.
 #
-# Every job always runs and reports, so all repositories produce the same
-# check names (see README.md). A job whose check does not apply to the
-# repository (no openspec/, no Cargo.toml, not a pull request) passes after
-# a notice instead of being skipped.
+# On a pull request every job runs and reports, so all repositories produce
+# the same check names (see README.md). A job whose check does not apply to
+# the repository (no openspec/, no Cargo.toml) passes after a notice instead
+# of being skipped.
 #
-# On a scheduled run (the daily run of the callers) only `deny` does work:
-# advisories change without a commit, the other checks do not. The other jobs
-# are skipped there; schedules have no required checks.
+# On a scheduled run (the daily run of the callers) only `deny` and the
+# notice of `human-gate` run: advisories change without a commit, the other
+# checks do not. `gitleaks`, `openspec` and `rust` are skipped there;
+# schedules have no required checks.
 name: checks
 
 on:
@@ -160,9 +161,9 @@ jobs:
             '.github/*' .gitleaks.toml .gitleaksignore
             # Secret encryption rules.
             .sops.yaml
-            # Supply chain policy (cargo-deny): licenses, bans, sources and
-            # ignored advisories.
-            deny.toml
+            # Supply chain policy: cargo-deny (licenses, bans, sources and
+            # ignored advisories) and the exceptions of the advisory step.
+            deny.toml advisory-exceptions.json
             # Authentication.
             'auth/*' '*/auth/*' 'oauth/*' '*/oauth/*'
             'authentication/*' '*/authentication/*' 'login/*' '*/login/*'
@@ -439,11 +440,21 @@ jobs:
         working-directory: ${{ inputs.rust-directory }}
         run: '"$RUNNER_TEMP/cargo-deny" --locked --config deny.toml check advisories licenses bans sources'
 
-      # Fails when a locked quinn, quinn-proto or quinn-udp is inside the
-      # affected range of a published advisory and not at a patched version.
-      # Without those crates in Cargo.lock the API is not called.
+      # Fails when a locked quinn, quinn-proto or quinn-udp is affected by a
+      # published advisory, or when the answer cannot be trusted (see
+      # README.md). Without those crates in Cargo.lock the API is not called.
+      # MIN_ADVISORIES is the number published on 2026-10-04: advisories are
+      # withdrawn, never deleted, so fewer means a broken answer. Raise it
+      # when quinn publishes more.
       - name: quinn security advisories
         if: ${{ !cancelled() && steps.tools.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ github.token }}
-        run: .cogwyrm-ci/tools/repo-advisories/check.sh "$RUST_DIR/Cargo.lock" quinn-rs/quinn quinn quinn-proto quinn-udp
+          MIN_ADVISORIES: "13"
+        run: |
+          .cogwyrm-ci/tools/repo-advisories/check.sh \
+            --lock "$RUST_DIR/Cargo.lock" \
+            --repo quinn-rs/quinn \
+            --min-advisories "$MIN_ADVISORIES" \
+            --exceptions "$RUST_DIR/advisory-exceptions.json" \
+            quinn quinn-proto quinn-udp

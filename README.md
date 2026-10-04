@@ -14,7 +14,7 @@ Nenhum repositório tem a lógica de CI própria: cada um tem só um `ci.yml` cu
 | [`infra-checks.yml`](.github/workflows/infra-checks.yml) | só o `infra` | `tofu` e `kubeconform` |
 | [`add-to-project.yml`](.github/workflows/add-to-project.yml) | todos os repositórios privados, pelo `project.yml` | Põe a issue ou o PR no [projeto da organização](https://github.com/orgs/Cogwyrm-Studios/projects/1) (veja [Projeto da organização](#projeto-da-organização)) |
 
-Todo job roda sempre e informa um resultado. Quando a verificação não se aplica ao repositório (sem `openspec/`, sem `Cargo.toml`, sem código OpenTofu ou manifestos), o job passa com um aviso em vez de ser pulado. Assim todos os repositórios produzem os mesmos nomes de check, e uma falha anterior nunca é trocada por um "pulado".
+Em pull request, todo job roda sempre e informa um resultado (na execução diária agendada, só o `deny` trabalha; veja [Execução diária](#execução-diária)). Quando a verificação não se aplica ao repositório (sem `openspec/`, sem `Cargo.toml`, sem código OpenTofu ou manifestos), o job passa com um aviso em vez de ser pulado. Assim todos os repositórios produzem os mesmos nomes de check, e uma falha anterior nunca é trocada por um "pulado".
 
 ### Checks
 
@@ -24,7 +24,7 @@ Todo job roda sempre e informa um resultado. Quando a verificação não se apli
 | `ci / openspec` | `openspec validate --all --strict` com o [OpenSpec](https://github.com/Fission-AI/OpenSpec) 1.13.2, sem telemetria. O CLI e todas as dependências dele vêm do lockfile em [`tools/openspec/`](tools/openspec/), instalados com `npm ci --ignore-scripts`. | Sem pasta `openspec/`. |
 | `ci / human-gate` | Portão de aprovação humana (veja abaixo). | Fora de pull request. |
 | `ci / rust` | `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings` e `cargo test --locked`. Usa o `rust-toolchain.toml` do repositório, se houver; senão, o stable da imagem do runner. | Sem `Cargo.toml` no diretório configurado. |
-| `ci / deny` | Cadeia de suprimentos do Rust ([orrery#49-D2](https://github.com/Cogwyrm-Studios/orrery/issues/49)): `cargo deny --locked check advisories licenses bans sources` com o [cargo-deny](https://github.com/EmbarkStudios/cargo-deny) 0.20.2 (binário da release com checksum SHA-256 conferido) e o `deny.toml` do repositório; qualquer erro de qualquer das quatro verificações bloqueia. **Falha se houver `Cargo.toml` sem `deny.toml`** no mesmo diretório. Depois, o passo dos avisos do quinn (veja [Avisos de segurança do quinn](#avisos-de-segurança-do-quinn)), que roda mesmo se o `cargo deny` falhar. | Sem `Cargo.toml` no diretório configurado. |
+| `ci / deny` | Cadeia de suprimentos do Rust ([orrery#49-D2](https://github.com/Cogwyrm-Studios/orrery/issues/49)): `cargo deny --locked check advisories licenses bans sources` com o [cargo-deny](https://github.com/EmbarkStudios/cargo-deny) 0.20.2 (binário da release com checksum SHA-256 conferido) e o `deny.toml` do repositório; qualquer erro de qualquer das quatro verificações bloqueia. **Falha se houver `Cargo.toml` sem `deny.toml`** no mesmo diretório. Depois, o passo dos avisos do quinn (veja [Avisos de segurança do quinn](#avisos-de-segurança-do-quinn)), que roda mesmo se o `cargo deny` falhar e aceita exceções revisadas em `advisory-exceptions.json`. | Sem `Cargo.toml` no diretório configurado. |
 | `infra / tofu` | `tofu fmt -check -recursive` e `tofu validate` em cada diretório com `.tf` dentro de `tofu/`, sem backend e sem credenciais. Diretórios com `.terraform.lock.hcl` têm que bater com ele. | Sem código OpenTofu. |
 | `infra / kubeconform` | Manifestos Kubernetes com o [kubeconform](https://github.com/yannh/kubeconform) 0.8.0 (checksum conferido), em modo estrito. Arquivos `*.sops.yaml`, `*.enc.yaml` e `kustomization.yaml` ficam de fora; recursos sem schema publicado (Argo CD, Agones) são contados como pulados. | Sem manifestos nos diretórios configurados. |
 
@@ -72,7 +72,7 @@ Caminhos protegidos por padrão:
 - **OpenTofu:** todo `*.tf.json` e `*.tofu.json`; e arquivo `.tf` ou `.tofu` cujo diff adiciona ou remove uma linha com `source =`, `version =`, `required_version` ou `required_providers` em qualquer posição (inclusive blocos numa linha só, como `aws = { source = "...", version = "..." }`). Se o GitHub não mostrar o diff do arquivo, ele conta como protegido.
 - **CI e regras de varredura:** tudo em `.github/` (inclusive os workflows, para que um PR não troque o próprio portão), `.gitleaks.toml` e `.gitleaksignore`.
 - **Cifragem de segredos:** `.sops.yaml`.
-- **Política da cadeia de suprimentos:** `deny.toml` (licenças, crates banidas, origens e avisos ignorados do `cargo-deny`).
+- **Política da cadeia de suprimentos:** `deny.toml` (licenças, crates banidas, origens e avisos ignorados do `cargo-deny`) e `advisory-exceptions.json` (exceções do passo dos avisos do quinn).
 - **Autenticação:** pastas `auth/`, `oauth/`, `authentication/` e `login/`, e arquivos `auth.*`, `auth_*`, `*_auth.*` e `oauth*`.
 - **Pagamentos:** pastas `payment/`, `payments/`, `billing/`, `purchase/` e `purchases/`, e arquivos `payment*`, `*_payment*` e `billing*`.
 
@@ -175,26 +175,71 @@ O `ci.yml` deste repositório chama a cópia local (`./.github/workflows/checks.
 
 ### Avisos de segurança do quinn
 
-O `cargo-deny` só lê a [RustSec](https://rustsec.org/). O quinn publica a maior parte dos avisos dele só como GHSA no próprio repositório: em 2026, a RustSec tinha 2 dos 11, e quatro nem chegaram ao banco global do GitHub, então Dependabot e `osv-scanner` também não os veem (ata de [orrery#49](https://github.com/Cogwyrm-Studios/orrery/issues/49)). Por isso o job `deny` tem um passo próprio, [`tools/repo-advisories/check.sh`](tools/repo-advisories/check.sh), só com `bash`, `curl`, `awk` e `jq`, todos da imagem do runner:
+O `cargo-deny` só lê a [RustSec](https://rustsec.org/), e o quinn publica a maior parte dos avisos dele só como GHSA no próprio repositório. Em 2026-10-04, dos 11 avisos que o quinn publicou em 2026, só 2 estavam na RustSec (base de 2026-10-03: RUSTSEC-2026-0037 e RUSTSEC-2026-0185) e só esses mesmos 2 no banco global do GitHub. Os outros 9 Dependabot e `osv-scanner` também não veem. Por isso o job `deny` tem um passo próprio, [`tools/repo-advisories/check.sh`](tools/repo-advisories/check.sh), só com `bash`, `curl`, `awk`, `date` e `jq`, todos da imagem do runner.
+
+#### O que o passo faz
 
 1. Lê do `Cargo.lock` as versões travadas de `quinn`, `quinn-proto` e `quinn-udp`. Se nenhum deles estiver no lock, termina com aviso, sem chamar a API.
-2. Lê todos os avisos publicados de `repos/quinn-rs/quinn/security-advisories` (`state=published`, seguindo a paginação por cursor), com o `GITHUB_TOKEN` do workflow. Se a API recusar o token (401, 403 ou 404), repete sem autenticação, com um aviso no log. Avisos retirados (`withdrawn_at`) e de outro ecossistema ficam de fora.
-3. Uma versão travada é **afetada** quando está dentro de `vulnerable_version_range` e não está corrigida por `patched_versions`. Qualquer versão afetada falha o check, com o GHSA, a gravidade, a faixa e a correção no log.
+2. Lê todos os avisos publicados de `repos/quinn-rs/quinn/security-advisories` (`state=published`, seguindo a paginação por cursor), com o `GITHUB_TOKEN` do workflow. Se a API recusar o token (401, 403 ou 404), repete sem autenticação, com um aviso no log.
+3. Confere a resposta: menos avisos que o mínimo conhecido (`MIN_ADVISORIES`, 13 em 2026-10-04; aviso é retirado, nunca apagado) falha. Aviso retirado (`withdrawn_at`) fica de fora. Aviso publicado sem pacote, ou com algum pacote que não seja exatamente do ecossistema `rust`, falha.
+4. Classifica cada versão travada de cada aviso, como abaixo.
 
-As faixas são texto livre digitado pelos mantenedores, e os avisos do quinn usam formas diferentes. O script aceita as formas vistas e recusa o resto:
+As faixas e as correções são texto livre digitado pelos mantenedores. O script aceita estas formas e recusa o resto:
 
 | Forma | Leitura |
 | --- | --- |
 | `>= 0.11.0, <= 0.11.18` | vírgula junta restrições (sintaxe do GHSA, E) |
 | `0.11.17` ou `= 0.11.13` | versão exata |
-| `0.11.0 - 0.11.6` | faixa inclusiva |
+| `0.11.0 - 0.11.6` | faixa inclusiva (com espaços em volta do hífen) |
 | `< 0.5.16, >= 0.6.0 < 0.6.3` | o E é vazio, então os grupos separados por vírgula são alternativas (OU), que é o que o aviso quis dizer |
+| `0.9.5, 0.10.5` ou `>= 0.11.19` (correção) | primeira versão corrigida de cada linha semver compatível (mesmo major; abaixo de 1.0, mesmo minor) |
 
-`patched_versions` lista a primeira versão corrigida de cada linha (`0.11.17`, `>= 0.11.19`, `0.9.5, 0.10.5`). Uma versão está corrigida quando está na correção da sua própria linha semver compatível ou acima dela, ou acima de todas as correções listadas. Assim, uma faixa que esqueceu o limite de cima (`> 0.7.0`, corrigido em `>= 0.11.18`) não acusa versões já corrigidas, e uma linha antiga sem correção própria continua afetada.
+Recusados, com falha: pré-release ou metadado de build (`0.11.7-rc.1`, e `0.11.0-0.11.6` sem espaços, que parece pré-release); versão parcial depois de `=`, sem operador, depois de `<=` ou depois de `>` (`= 0.11`, `0.11`, `<= 0.11`, `> 0.11`, todos ambíguos); qualquer outro operador (`^0.11`, `~0.11`). Versão parcial depois de `<` ou `>=` é completada com zeros, o que é exato (`< 0.12` é `< 0.12.0`). Mais de uma correção para a mesma linha também falha.
 
-Faixa ou versão que o script não entende (por exemplo `^0.5`) falha o check com o GHSA no log: na dúvida, ele nunca passa. Falha da API também falha o check.
+Classificação de uma versão travada:
 
-Para testar localmente: `GH_TOKEN=$(gh auth token) tools/repo-advisories/check.sh caminho/Cargo.lock quinn-rs/quinn quinn quinn-proto quinn-udp`.
+| Situação | Resultado |
+| --- | --- |
+| abaixo da correção listada para a própria linha, dentro ou fora da faixa | **afetada** (exit 1) |
+| na correção da própria linha ou acima dela | limpa, mesmo dentro de uma faixa sem limite de cima (`> 0.7.0`) |
+| dentro da faixa, sem nenhuma correção publicada | **afetada** (exit 1) |
+| dentro da faixa, com correções só para outras linhas | **não resolvida** (exit 2): o aviso não diz se a linha está corrigida |
+| fora da faixa e sem correção para a própria linha | limpa |
+
+O caso "não resolvida" é o de uma linha nova, por exemplo `quinn-proto` 0.12 diante de GHSA-465w (`> 0.7.0`, corrigido em `>= 0.11.18`) ou GHSA-qfwj (`>= 0.11.15`, corrigido em `0.11.17`). Ele só passa com uma exceção revisada.
+
+O passo **falha fechado**: falha da API, resposta curta, aviso sem pacote Rust utilizável, faixa ou correção recusada, versão não resolvida e exceção inválida, vencida ou sem uso falham o check (exit 2). Nenhum desses casos passa por padrão.
+
+#### Exceções revisadas
+
+Uma exceção fica no repositório que consome o workflow, em `advisory-exceptions.json`, ao lado do `Cargo.toml` (no `rust-directory`). É caminho protegido do `human-gate`, então toda exceção passa pela revisão do Denilson, como um `ignore` do `deny.toml`.
+
+```json
+{
+  "exceptions": [
+    {
+      "advisory": "GHSA-465w-v9q3-7j98",
+      "crate": "quinn-proto",
+      "version": "0.12.0",
+      "reason": "Explica por que a versão não é afetada, com a fonte (commit, release notes).",
+      "review-by": "2026-12-01"
+    }
+  ]
+}
+```
+
+- Cada exceção vale para um GHSA, um crate e **uma versão exata**: atualizar o crate exige revisar a exceção de novo.
+- Sem `crate` e `version`, a exceção vale para um achado do aviso inteiro (aviso sem pacote Rust utilizável, por exemplo). Os dois campos vêm juntos ou nenhum.
+- `reason` é obrigatório. `review-by` é uma data `AAAA-MM-DD`: depois dela, a exceção vence e o check falha até alguém revisar.
+- Exceção que não casa com nenhum achado falha, como o `unused-ignored-advisory` do `deny.toml`. Exceção duplicada, chave desconhecida ou arquivo fora do formato também falham.
+- Achado coberto por exceção aparece como aviso no log, com o motivo e a data de revisão.
+- Falha da API, resposta curta e erro no próprio arquivo de exceções não têm exceção.
+
+#### Testes
+
+[`tools/repo-advisories/test.sh`](tools/repo-advisories/test.sh) roda o script contra uma API falsa (`python3 -m http.server`) com 40 casos: cada regra acima, as formas recusadas, as exceções e as falhas da API. O job `advisory-tests` do `ci.yml` deste repositório roda os testes em todo PR daqui; ele não existe nos callers.
+
+Para testar contra a API real: `GH_TOKEN=$(gh auth token) tools/repo-advisories/check.sh --lock caminho/Cargo.lock --repo quinn-rs/quinn --min-advisories 13 --exceptions caminho/advisory-exceptions.json quinn quinn-proto quinn-udp`.
 
 ### Limite conhecido: o caller pode ser trocado
 
