@@ -146,11 +146,13 @@ jobs:
 
       # A symlink would let an unprotected path stand in for a protected
       # Claude Code file, so none is accepted in Claude Code locations,
-      # except a link inside a .claude/hooks/ directory that points to a
-      # path inside that same directory. Submodules are not accepted there
-      # either. The label does not override this.
-      # The whole head tree is checked, not only the changed files: a link
-      # already in place would let a change to its target bypass the gate.
+      # except a link inside a .claude/hooks/ directory that, followed
+      # through the head tree as the file system would (links in the way
+      # included), ends at a regular file inside that same directory.
+      # Submodules are not accepted there either. The label does not
+      # override this. The whole head tree is checked, not only the changed
+      # files: a link already in place would let a change to its target
+      # bypass the gate.
       - name: Check Claude Code symlinks and submodules
         if: github.event_name == 'pull_request'
         env:
@@ -175,37 +177,97 @@ jobs:
             memory '*/memory' 'memory/rules.md' '*/memory/rules.md'
           )
 
-          # Resolves "/dir/target" without touching the disk; fails when
-          # ".." climbs above the repository root.
-          normalize() {
-            local part
-            local -a parts out=()
-            IFS=/ read -r -a parts <<< "$1"
-            for part in "${parts[@]}"; do
-              case "$part" in
-                "" | .) ;;
-                ..)
-                  if [ "${#out[@]}" -eq 0 ]; then return 1; fi
-                  unset 'out[-1]'
-                  ;;
-                *) out+=("$part") ;;
-              esac
-            done
-            printf '/%s' "${out[@]}"
-          }
-
           work="$RUNNER_TEMP/human-gate-symlinks"
           mkdir -p "$work"
-          git ls-tree -r -z --full-tree HEAD > "$work/tree" \
+          git ls-tree -r -t -z --full-tree HEAD > "$work/tree" \
             || fail "Could not list the tree of the head commit."
 
-          violations=()
+          # Every entry of the head tree (directories included) by lowercase
+          # path: "mode sha", or "ambiguous" when two paths differ only in
+          # case.
+          declare -A entries=()
+          link_paths=()
+          link_modes=()
           while IFS= read -r -d '' record; do
             meta="${record%%$'\t'*}"
             path="${record#*$'\t'}"
+            lpath="${path,,}"
             mode="${meta%% *}"
-            if [ "$mode" != 120000 ] && [ "$mode" != 160000 ]; then continue; fi
-            sha="${meta##* }"
+            if [ -n "${entries[$lpath]+set}" ]; then
+              entries[$lpath]=ambiguous
+            else
+              entries[$lpath]="$mode ${meta##* }"
+            fi
+            if [ "$mode" = 120000 ] || [ "$mode" = 160000 ]; then
+              link_paths+=("$path")
+              link_modes+=("$mode")
+            fi
+          done < "$work/tree"
+
+          # Prints the lowercase target of the link with blob $1. Fails on an
+          # empty target or one with a newline or NUL byte.
+          link_target() {
+            gh api "repos/$REPO/git/blobs/$1" > "$work/blob.json" || return 1
+            jq -r '.content' "$work/blob.json" | base64 -d > "$work/target" || return 1
+            if [ ! -s "$work/target" ] \
+              || [ "$(tr -d '\n\000' < "$work/target" | wc -c)" -ne "$(wc -c < "$work/target")" ]; then
+              return 1
+            fi
+            local target
+            target="$(< "$work/target")"
+            printf '%s' "${target,,}"
+          }
+
+          # Follows the link at the lowercase path $1 through the head tree,
+          # as the file system would, and prints where it ends. Fails on an
+          # absolute target, a ".." above the root, a missing or ambiguous
+          # entry, a submodule, a file used as a directory or more than 40
+          # links.
+          resolve() {
+            local cur="$1" hops=0 entry target part
+            local -a dir=() queue=() parts=()
+            while :; do
+              hops=$((hops + 1))
+              if [ "$hops" -gt 40 ]; then return 1; fi
+              entry="${entries[$cur]}"
+              target="$(link_target "${entry#* }")" || return 1
+              if [[ "$target" == /* ]]; then return 1; fi
+              dir=()
+              if [[ "$cur" == */* ]]; then IFS=/ read -r -a dir <<< "${cur%/*}"; fi
+              IFS=/ read -r -a parts <<< "$target"
+              queue=("${parts[@]}" "${queue[@]}")
+              while [ "${#queue[@]}" -gt 0 ]; do
+                part="${queue[0]}"
+                queue=("${queue[@]:1}")
+                case "$part" in
+                  "" | .) continue ;;
+                  ..)
+                    if [ "${#dir[@]}" -eq 0 ]; then return 1; fi
+                    unset 'dir[-1]'
+                    continue
+                    ;;
+                esac
+                dir+=("$part")
+                cur="$(IFS=/; printf '%s' "${dir[*]}")"
+                entry="${entries[$cur]-}"
+                case "$entry" in
+                  120000\ *) continue 2 ;;
+                  040000\ *) ;;
+                  100644\ * | 100755\ *)
+                    if [ "${#queue[@]}" -gt 0 ]; then return 1; fi
+                    ;;
+                  *) return 1 ;;
+                esac
+              done
+              if [ "${#dir[@]}" -eq 0 ]; then return 1; fi
+              (IFS=/; printf '%s' "${dir[*]}")
+              return 0
+            done
+          }
+
+          violations=()
+          for i in "${!link_paths[@]}"; do
+            path="${link_paths[$i]}"
             lpath="${path,,}"
             claude=""
             for pattern in "${patterns[@]}"; do
@@ -216,7 +278,7 @@ jobs:
 
             # A submodule brings content from another repository: a bump of
             # its commit would change Claude Code files unseen.
-            if [ "$mode" = 160000 ]; then
+            if [ "${link_modes[$i]}" = 160000 ]; then
               violations+=("$path (submodule in a Claude Code location)")
               continue
             fi
@@ -224,26 +286,17 @@ jobs:
               violations+=("$path (symlink in a Claude Code location)")
               continue
             fi
-            gh api "repos/$REPO/git/blobs/$sha" > "$work/blob.json" \
-              || fail "Could not read the target of the symlink $path."
-            jq -r '.content' "$work/blob.json" | base64 -d > "$work/target" \
-              || fail "Could not decode the target of the symlink $path."
-            # A target with a newline or NUL byte cannot be compared safely.
-            if [ "$(tr -d '\n\000' < "$work/target" | wc -c)" -ne "$(wc -c < "$work/target")" ]; then
-              violations+=("$path (symlink target with a newline or NUL byte)")
-              continue
-            fi
-            target="$(< "$work/target")"
-            ltarget="${target,,}"
             # The innermost .claude/hooks directory that holds the link.
             hooks_dir="/$lpath"
             hooks_dir="${hooks_dir%/.claude/hooks/*}/.claude/hooks"
-            if [[ -z "$ltarget" || "$ltarget" == /* ]] \
-              || ! resolved="$(normalize "/${lpath%/*}/$ltarget")" \
-              || [[ "$resolved" != "$hooks_dir"/* ]]; then
-              violations+=("$path -> $target (points outside its .claude/hooks/ directory)")
+            if [ "${entries[$lpath]}" = ambiguous ] || ! resolved="$(resolve "$lpath")"; then
+              violations+=("$path (symlink that does not resolve to a file in the head tree)")
+            elif [[ "/$resolved" != "$hooks_dir"/* ]]; then
+              violations+=("$path -> $resolved (points outside its .claude/hooks/ directory)")
+            elif [[ "${entries[$resolved]}" != 100644\ * && "${entries[$resolved]}" != 100755\ * ]]; then
+              violations+=("$path -> $resolved (does not point to a regular file)")
             fi
-          done < "$work/tree"
+          done
 
           if [ "${#violations[@]}" -eq 0 ]; then
             echo "No symlinks or submodules in Claude Code locations, other than links inside .claude/hooks/."
@@ -251,7 +304,7 @@ jobs:
           fi
           echo "Symlinks or submodules not allowed:"
           printf '  %s\n' "${violations[@]}"
-          fail "Claude Code locations accept no symlinks or submodules, except links inside a .claude/hooks/ directory to a path in that same directory. The '$APPROVAL_LABEL' label does not override this."
+          fail "Claude Code locations accept no symlinks or submodules, except links inside a .claude/hooks/ directory to a regular file in that same directory. The '$APPROVAL_LABEL' label does not override this."
 
       - name: Check protected paths
         if: github.event_name == 'pull_request'
@@ -293,8 +346,9 @@ jobs:
             # settings and executables, and the rules injected into every
             # session. They run commands or grant permissions on every
             # machine that pulls the repository. A .claude or .claude/hooks
-            # that is a symlink shows up as a single file. Markdown under
-            # .claude/ and plugins/ is inspected below (frontmatter hooks).
+            # that is a symlink shows up as a single file. Below, every other
+            # file under .claude/ or plugins/<name>/ is protected too, and
+            # Markdown there is inspected (frontmatter and ```! blocks).
             '.claude/settings*.json' '*/.claude/settings*.json'
             '.claude/hooks/*' '*/.claude/hooks/*' '.claude/hooks' '*/.claude/hooks'
             .claude
@@ -338,8 +392,63 @@ jobs:
             fail "Listed $listed files, but the pull request changes $changed_files."
           fi
 
+          base_sha="$(jq -r '.base.sha' "$work/pr.json")"
+          head_sha="$(jq -r '.head.sha' "$work/pr.json")"
+          merge_base=""
+
+          # Line ranges ("first last ...") of the frontmatter and of the ```!
+          # blocks of a Markdown file. An unclosed one runs to the end.
+          # shellcheck disable=SC2016 # awk program, not shell
+          ranges_awk='
+            { sub(/\r$/, "") }
+            NR == 1 { sub(/^\357\273\277/, ""); if ($0 ~ /^---[ \t]*$/) { fm = 1; next } }
+            fm == 1 { if ($0 ~ /^---[ \t]*$/) { printf "1 %d ", NR; fm = 2 }; next }
+            fence == "" && $0 ~ /^[ \t]*(```+|~~~+)!/ {
+              match($0, /[`~]+/); fence = substr($0, RSTART, RLENGTH); start = NR; next
+            }
+            fence != "" && $0 ~ /^[ \t]*(`+|~+)[ \t]*$/ {
+              match($0, /[`~]+/); m = substr($0, RSTART, RLENGTH)
+              if (substr(m, 1, 1) == substr(fence, 1, 1) && length(m) >= length(fence)) {
+                printf "%d %d ", start, NR; fence = ""
+              }
+            }
+            END { if (fm == 1) printf "1 %d ", NR; if (fence != "") printf "%d %d ", start, NR }'
+          # Succeeds when an added line falls inside a range of "new" or a
+          # removed line inside a range of "old".
+          # shellcheck disable=SC2016 # awk program, not shell
+          hunks_awk='
+            function inside(n, r,   a, k, i) {
+              k = split(r, a, " ")
+              for (i = 1; i < k; i += 2) if (n >= a[i] + 0 && n <= a[i + 1] + 0) return 1
+              return 0
+            }
+            /^@@/ {
+              match($0, /-[0-9]+/); o = substr($0, RSTART + 1, RLENGTH - 1) + 0
+              match($0, /\+[0-9]+/); n = substr($0, RSTART + 1, RLENGTH - 1) + 0
+              next
+            }
+            /^\\/ { next }
+            /^-/ { if (inside(o, old)) hit = 1; o++; next }
+            /^\+/ { if (inside(n, new)) hit = 1; n++; next }
+            { o++; n++ }
+            END { exit !hit }'
+          # Prints the ranges of the file $2 at commit $1.
+          ranges_at() {
+            local encoded
+            encoded="$(jq -rn --arg p "$2" '$p | split("/") | map(@uri) | join("/")')"
+            gh api -H 'Accept: application/vnd.github.raw+json' \
+              "repos/$REPO/contents/$encoded?ref=$1" > "$work/content" || return 1
+            awk "$ranges_awk" "$work/content"
+          }
+
           matches=()
           while IFS= read -r entry; do
+            # A control character (a newline above all) would split the
+            # paths below and hide a protected one.
+            if jq -e '[.filename, (.previous_filename // empty)] | any(test("[[:cntrl:]]"))' \
+              <<< "$entry" > /dev/null; then
+              fail "A file name in this pull request has a control character; the gate cannot check it. Rename the file."
+            fi
             file="$(jq -r '.filename' <<< "$entry")"
             # Renames also count their old path.
             mapfile -t paths < <(jq -r '.filename, (.previous_filename // empty)' <<< "$entry")
@@ -373,32 +482,61 @@ jobs:
                 fi
               fi
             fi
-            # Claude Code skills, agents and commands: their frontmatter
-            # accepts hooks (and mcpServers, permissionMode, allowed-tools)
-            # and their body runs !`command` and ```! blocks. Every .md
-            # under a .claude/ or plugins/ directory is inspected: any added
-            # or removed line with one of those keys anywhere in it, an
-            # inline command, a YAML hex escape or an explicit key ("? ")
-            # protects the file. A new file shows all its lines and a
-            # removed one too. A rename or copy protects the file, because
-            # the diff does not show the frontmatter that moved. Without a
-            # diff (too large or binary), the file counts as protected.
+            # Claude Code skills, agents, commands and plugins. Every file
+            # that is not Markdown under a .claude/ directory or a plugin
+            # (plugins/<name>/) is protected: scripts that skills, hooks and
+            # servers run live there. Markdown is inspected: the frontmatter
+            # accepts hooks, mcpServers, permissionMode and allowed-tools,
+            # and the body runs !`command` and ```! blocks. The file is
+            # protected when an added or removed line falls inside the
+            # frontmatter or a ```! block (of the file before or after the
+            # change), or anywhere has one of those keys, an inline command,
+            # a YAML hex escape, an explicit key ("? ") or an anchor or alias.
+            # A rename or copy protects the file, because the diff does not
+            # show the frontmatter that moved. Without a diff (too large or
+            # binary), or when the frontmatter cannot be read, the file
+            # counts as protected.
             if [ -z "$matched" ]; then
               for path in "${paths[@]}"; do
-                if [[ "$path" == *.md && ( "$path" == .claude/* || "$path" == */.claude/* \
-                  || "$path" == plugins/* || "$path" == */plugins/* ) ]]; then
-                  if jq -e 'has("previous_filename")' <<< "$entry" > /dev/null; then
-                    matched="$path (Claude Code instructions renamed or copied)"
-                  elif ! jq -e 'has("patch")' <<< "$entry" > /dev/null; then
-                    matched="$path (Claude Code instructions diff unavailable)"
-                  elif patch="$(jq -r '.patch' <<< "$entry")" && grep -qiE \
+                if [[ "$path" != .claude/* && "$path" != */.claude/* \
+                  && "$path" != plugins/*/* && "$path" != */plugins/*/* ]]; then
+                  continue
+                fi
+                if [[ "$path" != *.md ]]; then
+                  matched="$path (file of Claude Code settings, skills, agents, commands or plugins)"
+                elif jq -e 'has("previous_filename")' <<< "$entry" > /dev/null; then
+                  matched="$path (Claude Code instructions renamed or copied)"
+                elif ! jq -e 'has("patch")' <<< "$entry" > /dev/null; then
+                  matched="$path (Claude Code instructions diff unavailable)"
+                else
+                  patch="$(jq -r '.patch' <<< "$entry")"
+                  if grep -qiE \
                     -e "^[+-](.*[^[:alnum:]_-])?[\"']?(hooks|mcpServers|permissionMode|allowed-?tools)[\"']?[[:space:]]*:" \
                     -e '^[+-](.*[[:space:]])?!`' -e '^[+-][[:space:]]*(```|~~~)!' \
-                    -e '^[+-].*\\[xu][[:xdigit:]]{2}' -e '^[+-][[:space:]]*\?([[:space:]]|$)' <<< "$patch"; then
-                    matched="$path (Claude Code frontmatter key, inline command or YAML escape changed)"
+                    -e '^[+-].*\\[xu][[:xdigit:]]{2}' -e '^[+-][[:space:]]*\?([[:space:]]|$)' \
+                    -e '^[+-](.*[[:space:]])?&[[:alnum:]_.-]+([[:space:]]|$)' \
+                    -e '^[+-][[:space:]]*(-[[:space:]]+)?\*[^[:space:]]+[[:space:]]+:' \
+                    -e '^[+-].*:[[:space:]]+\*[^[:space:]*]+[[:space:]]*$' <<< "$patch"; then
+                    matched="$path (Claude Code frontmatter key, inline command, YAML escape, anchor or alias changed)"
+                  else
+                    if [ -z "$merge_base" ]; then
+                      merge_base="$(gh api "repos/$REPO/compare/$base_sha...$head_sha" --jq '.merge_base_commit.sha')" \
+                        || fail "Could not find the merge base of the pull request."
+                    fi
+                    status="$(jq -r '.status' <<< "$entry")"
+                    old_ranges=""
+                    new_ranges=""
+                    if { [ "$status" = added ] || old_ranges="$(ranges_at "$merge_base" "$path")"; } \
+                      && { [ "$status" = removed ] || new_ranges="$(ranges_at "$head_sha" "$path")"; }; then
+                      if awk -v old="$old_ranges" -v new="$new_ranges" "$hunks_awk" <<< "$patch"; then
+                        matched="$path (Claude Code frontmatter or \`\`\`! block changed)"
+                      fi
+                    else
+                      matched="$path (Claude Code instructions could not be read)"
+                    fi
                   fi
-                  break
                 fi
+                break
               done
             fi
             if [ -n "$matched" ]; then matches+=("$matched"); fi

@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Stub of "gh api" for test.sh, backed by the git repository $TEST_REPO.
+# Pull request files come from $TEST_FILES; the base commit is $TEST_BASE.
+set -u
+url=""
+jq_filter=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    api | --paginate) ;;
+    -H) shift ;;
+    --jq) jq_filter="$2"; shift ;;
+    repos/*) url="$1" ;;
+    *) echo "gh stub: unexpected argument $1" >&2; exit 1 ;;
+  esac
+  shift
+done
+case "$url" in
+  */pulls/*/files\?*) jq -r "$jq_filter" "$TEST_FILES" ;;
+  */pulls/*)
+    jq -n --argjson n "$(jq length "$TEST_FILES")" --arg b "$TEST_BASE" \
+      --arg h "$(git -C "$TEST_REPO" rev-parse HEAD)" \
+      '{changed_files: $n, labels: [], base: {sha: $b}, head: {sha: $h, ref: "b"}}' ;;
+  */compare/*)
+    range="${url##*/compare/}"
+    git -C "$TEST_REPO" merge-base "${range%%...*}" "${range##*...}" ;;
+  */contents/*)
+    path="${url#*/contents/}"
+    ref="${path##*\?ref=}"
+    path="$(python3 -c 'import sys, urllib.parse; print(urllib.parse.unquote(sys.argv[1]))' "${path%\?ref=*}")"
+    git -C "$TEST_REPO" cat-file blob "$ref:$path" ;;
+  */git/blobs/*)
+    sha="${url##*/git/blobs/}"
+    content="$(git -C "$TEST_REPO" cat-file blob "$sha" | base64 -w 60)" || exit 1
+    jq -n --arg c "$content" '{encoding: "base64", content: ($c + "\n")}' ;;
+  *) echo "gh stub: unexpected call $url" >&2; exit 1 ;;
+esac

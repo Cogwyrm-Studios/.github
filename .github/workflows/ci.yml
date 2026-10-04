@@ -33,3 +33,18 @@ jobs:
 
       - name: Run the tests
         run: tools/repo-advisories/test.sh
+
+  # Tests of the human-gate job of checks.yml (tools/human-gate/test.sh),
+  # against local git repositories and a stub of the GitHub API.
+  human-gate-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run the tests
+        run: tools/human-gate/test.sh
