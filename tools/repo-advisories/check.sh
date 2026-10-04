@@ -146,11 +146,16 @@ echo "Published advisories of $repo: $count"
 #   of its own line, or outside the range with no fix for its line. Inside
 #   the range with fixes listed only for other lines it is UNRESOLVED: a new
 #   line (say 0.12) under an open range ("> 0.7.0") needs a reviewed
-#   exception, because the advisory does not say whether it is fixed.
+#   exception, because the advisory does not say whether it is fixed. At or
+#   above the fix of its own line but inside a range with an upper bound is
+#   contradictory data, an ERROR.
+# - An advisory with an unusable entry gives one advisory-level ERROR; its
+#   usable Rust entries are still evaluated.
 jq -n -r \
   --rawfile locked "$work/locked.tsv" \
   --slurpfile exfile "$work/exceptions.json" \
   --arg today "$(date -u +%Y-%m-%d)" \
+  --arg latest "$(date -u -d '+90 days' +%Y-%m-%d)" \
   --arg repo "$repo" '
   def trim: gsub("^\\s+|\\s+$"; "");
   # Locked version: [major, minor, patch, release]; a pre-release sorts
@@ -193,13 +198,18 @@ jq -n -r \
     | ([[0, 0, 0, 0], [1000000000, 0, 0, 1]]
        + [$cs[].v | ., [.[0], .[1], .[2], 1], [.[0], .[1], .[2] + 1, 0]])
     | any(.[]; . as $v | $cs | all_ok($v));
-  def in_range($v):
-    if . == null or (trim == "") then true
+  def bounded: any(.[]; .op == "<" or .op == "<=" or .op == "=");
+  # {in, bounded}: whether $v is inside the range, and whether the
+  # constraints that put it there have an upper bound.
+  def range_hit($v):
+    if . == null or (trim == "") then {in: true, bounded: false}
     else [split(",")[] | trim | select(. != "") | group] as $groups
       | if $groups == [] then error("empty range") else . end
       | ($groups | add) as $all
-      | if ($all | satisfiable) then ($all | all_ok($v))
-        else any($groups[]; all_ok($v)) end
+      | if ($all | satisfiable) then {in: ($all | all_ok($v)), bounded: ($all | bounded)}
+        else [$groups[] | select(all_ok($v))] as $hits
+          | {in: ($hits != []), bounded: any($hits[]; bounded)}
+        end
     end;
   def fixes:
     if . == null or (trim == "") then []
@@ -209,55 +219,64 @@ jq -n -r \
     end;
   def usable: (.package | type) == "object" and .package.ecosystem == "rust"
     and (.package.name | type) == "string" and .package.name != "";
-  def key($a; $c; $v): {advisory: $a, crate: $c, version: $v};
+  def key($a; $c; $v; $k): {advisory: $a, crate: $c, version: $v, kind: $k};
+  def showkey: "\(.advisory) \(.kind)\(if .crate then " \(.crate) \(.version)" else " (whole advisory)" end)";
 
   [$locked | split("\n")[] | select(. != "") | split("\t") | {name: .[0], version: .[1]}] as $pkgs
   | [inputs | select(.withdrawn_at == null)] as $advisories
 
-  # Findings: {key, kind, message}.
+  # Findings: {key, kind, message}; the kind is part of the key.
   | [ $advisories[] | . as $a | ($a.ghsa_id // "advisory without ghsa_id") as $id
-      | if ($a.vulnerabilities | type) != "array" or ($a.vulnerabilities | length) == 0 then
-          {key: key($id; null; null), kind: "ERROR",
-           message: "\($id) has no vulnerable package listed. \($a.html_url // "")"}
-        elif any($a.vulnerabilities[]; usable | not) then
-          {key: key($id; null; null), kind: "ERROR",
-           message: "\($id) lists a package that is not a Rust crate (ecosystem must be \"rust\"): \([$a.vulnerabilities[] | "\(.package.ecosystem // "null"):\(.package.name // "null")"] | join(", ")). \($a.html_url // "")"}
-        else
-          $a.vulnerabilities[] as $vuln
+      | (if ($a.vulnerabilities | type) != "array" then [] else $a.vulnerabilities end) as $vulns
+      | ( if $vulns == [] then
+            {key: key($id; null; null; "ERROR"), kind: "ERROR",
+             message: "\($id) has no vulnerable package listed. \($a.html_url // "")"}
+          elif any($vulns[]; usable | not) then
+            {key: key($id; null; null; "ERROR"), kind: "ERROR",
+             message: "\($id) lists a package that is not a Rust crate (ecosystem must be \"rust\"): \([$vulns[] | select(usable | not) | "\(.package.ecosystem? // "null"):\(.package.name? // "null")"] | join(", ")). \($a.html_url // "")"}
+          else empty end ),
+        # The usable Rust entries are always evaluated, even when the
+        # advisory also has an unusable entry.
+        ( $vulns[] | select(usable) as $vuln
           | $pkgs[] | select(.name == $vuln.package.name) as $pkg
-          | key($id; $pkg.name; $pkg.version) as $k
           | try (
               ($pkg.version | lver) as $v
-              | ($vuln.vulnerable_version_range | in_range($v)) as $inr
+              | ($vuln.vulnerable_version_range | range_hit($v)) as $hit
               | ($vuln.patched_versions | fixes) as $fixes
               | [$fixes[] | select(line == ($v | line))] as $own
               | "\($pkg.name) \($pkg.version), \($id) (\($a.severity // "unknown")): \($a.summary // ""). Vulnerable: \($vuln.vulnerable_version_range // "all"); patched: \($vuln.patched_versions // "none"). \($a.html_url // "")" as $about
               | if ($own | length) > 1 then
                   error("several fixes listed for the line of \($pkg.version)")
                 elif ($own | length) == 1 then
-                  if $v < $own[0] then {key: $k, kind: "AFFECTED", message: "Affected (below the fix \($own[0] | show) of its line): \($about)"}
+                  if $v < $own[0] then ["AFFECTED", "Affected (below the fix \($own[0] | show) of its line): \($about)"]
+                  elif $hit.in and $hit.bounded then
+                    error("contradictory advisory: \($pkg.version) is at or above the fix \($own[0] | show) of its line, but inside a range with an upper bound")
                   else empty end
-                elif $inr then
-                  if $fixes == [] then {key: $k, kind: "AFFECTED", message: "Affected (no fix published): \($about)"}
-                  else {key: $k, kind: "UNRESOLVED", message: "Inside the range, and no fix is listed for its line; needs a reviewed exception or an update: \($about)"} end
+                elif $hit.in then
+                  if $fixes == [] then ["AFFECTED", "Affected (no fix published): \($about)"]
+                  else ["UNRESOLVED", "Inside the range, and no fix is listed for its line; needs a reviewed exception or an update: \($about)"] end
                 else empty end
-            ) catch {key: $k, kind: "ERROR", message: "Cannot evaluate \($id) for \($pkg.name) \($pkg.version): \(.)"}
-        end
+            ) catch ["ERROR", "Cannot evaluate \($id) for \($pkg.name) \($pkg.version): \(.)"]
+          | {key: key($id; $pkg.name; $pkg.version; .[0]), kind: .[0], message: .[1]} )
     ] as $findings
 
-  # Exceptions: {advisory, crate, version, reason, review-by}; crate and
-  # version are both present (one locked package) or both absent (an
-  # advisory-level finding).
+  # Exceptions: {advisory, kind, crate, version, reason, review-by}; crate
+  # and version are both present (one locked package) or both absent (an
+  # advisory-level finding). The kind must match the finding, so a finding
+  # that changes kind leaves the exception unused.
+  | ["advisory", "kind", "crate", "version", "reason", "review-by"] as $allowed
   | ($exfile[0]) as $file
   | (if ($file | has("exceptions") | not) or ($file.exceptions | type) != "array"
          or ($file | keys) != ["exceptions"]
      then [{bad: "the file must be {\"exceptions\": [...]} and nothing else"}]
      else [$file.exceptions | to_entries[] | .key as $i | .value
        | if type != "object" then {bad: "entry \($i) is not an object"}
-         elif (keys - ["advisory", "crate", "version", "reason", "review-by"]) != [] then
-           {bad: "entry \($i) has unknown keys \(keys - ["advisory", "crate", "version", "reason", "review-by"])"}
+         elif (keys - $allowed) != [] then
+           {bad: "entry \($i) has unknown keys \(keys - $allowed)"}
          elif ((.advisory | type) != "string") or (.advisory | test("^GHSA(-[23456789cfghjmpqrvwx]{4}){3}$") | not) then
            {bad: "entry \($i) needs \"advisory\": a GHSA id"}
+         elif [.kind] | inside(["AFFECTED", "UNRESOLVED", "ERROR"]) | not then
+           {bad: "entry \($i) (\(.advisory)) needs \"kind\": AFFECTED, UNRESOLVED or ERROR"}
          elif ((.reason | type) != "string") or ((.reason | trim | length) < 10) then
            {bad: "entry \($i) (\(.advisory)) needs a \"reason\""}
          elif ((has("crate")) != (has("version"))) then
@@ -268,26 +287,31 @@ jq -n -r \
               or ((."review-by" | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}$")) | not)
               or ((try (."review-by" | strptime("%Y-%m-%d") | mktime | strftime("%Y-%m-%d")) catch "") != ."review-by") then
            {bad: "entry \($i) (\(.advisory)) needs \"review-by\" as a valid YYYY-MM-DD date"}
+         elif ."review-by" > $latest then
+           {bad: "entry \($i) (\(.advisory)): \"review-by\" \(."review-by") is more than 90 days ahead (latest \($latest))"}
          else
-           {key: key(.advisory; .crate; .version), reason, review: ."review-by",
+           {key: key(.advisory; .crate; .version; .kind), reason, review: ."review-by",
             expired: (."review-by" < $today)}
          end]
      end) as $exceptions
   | ([$exceptions[] | select(has("key")) | .key] | group_by(.) | map(select(length > 1) | .[0])) as $dups
   | [$exceptions[] | select(has("key") and (.expired | not))] as $valid
+  # An exception accepts a finding only when it matches exactly one.
+  | [$valid[] | . as $e | select([$findings[] | select(.key == $e.key)] | length == 1)] as $usable
 
   | ( $findings[]
       | . as $f
-      | [$valid[] | select(.key == $f.key)][0] as $ex
+      | [$usable[] | select(.key == $f.key)][0] as $ex
       | if $ex then ["EXCEPTED", "\($f.kind) accepted by the exception (\($ex.reason); review by \($ex.review)): \($f.message)"]
         else [$f.kind, $f.message] end
     ),
     ( $exceptions[] | select(has("bad")) | ["BADEXC", "Invalid exception: \(.bad)."] ),
-    ( $dups[] | ["BADEXC", "Duplicate exception for \(.advisory) \(.crate // "") \(.version // "")."] ),
+    ( $dups[] | ["BADEXC", "Duplicate exception for \(showkey)."] ),
     ( $exceptions[] | select(has("key") and .expired)
-      | ["BADEXC", "Expired exception for \(.key.advisory) \(.key.crate // "") \(.key.version // "") (review by \(.review), today is \($today)). Review it again or update the crate."] ),
-    ( $valid[] | . as $e | select(all($findings[]; .key != $e.key))
-      | ["BADEXC", "Unused exception for \(.key.advisory) \(.key.crate // "") \(.key.version // ""): no finding matches it. Remove it."] )
+      | ["BADEXC", "Expired exception for \(.key | showkey) (review by \(.review), today is \($today)). Review it again or update the crate."] ),
+    ( $valid[] | . as $e | ([$findings[] | select(.key == $e.key)] | length) as $n | select($n != 1)
+      | if $n == 0 then ["BADEXC", "Unused exception for \(.key | showkey): no finding of that kind matches it. Remove or update it."]
+        else ["BADEXC", "Exception for \(.key | showkey) matches \($n) findings; it must match exactly one."] end )
   | "\(.[0])\t\(.[1] | gsub("[\\t\\r\\n]+"; " "))"
 ' "$work/advisories.jsonl" > "$work/findings.tsv" || die "Could not evaluate the advisories of $repo."
 

@@ -181,7 +181,7 @@ O `cargo-deny` só lê a [RustSec](https://rustsec.org/), e o quinn publica a ma
 
 1. Lê do `Cargo.lock` as versões travadas de `quinn`, `quinn-proto` e `quinn-udp`. Se nenhum deles estiver no lock, termina com aviso, sem chamar a API.
 2. Lê todos os avisos publicados de `repos/quinn-rs/quinn/security-advisories` (`state=published`, seguindo a paginação por cursor), com o `GITHUB_TOKEN` do workflow. Se a API recusar o token (401, 403 ou 404), repete sem autenticação, com um aviso no log.
-3. Confere a resposta: menos avisos que o mínimo conhecido (`MIN_ADVISORIES`, 13 em 2026-10-04; aviso é retirado, nunca apagado) falha. Aviso retirado (`withdrawn_at`) fica de fora. Aviso publicado sem pacote, ou com algum pacote que não seja exatamente do ecossistema `rust`, falha.
+3. Confere a resposta: menos avisos que o mínimo conhecido (`MIN_ADVISORIES`, 13 em 2026-10-04; aviso é retirado, nunca apagado) falha. Aviso retirado (`withdrawn_at`) fica de fora. Aviso publicado sem pacote, ou com algum pacote que não seja exatamente do ecossistema `rust`, gera um erro do aviso inteiro; as entradas Rust utilizáveis desse aviso continuam sendo avaliadas.
 4. Classifica cada versão travada de cada aviso, como abaixo.
 
 As faixas e as correções são texto livre digitado pelos mantenedores. O script aceita estas formas e recusa o resto:
@@ -202,6 +202,7 @@ Classificação de uma versão travada:
 | --- | --- |
 | abaixo da correção listada para a própria linha, dentro ou fora da faixa | **afetada** (exit 1) |
 | na correção da própria linha ou acima dela | limpa, mesmo dentro de uma faixa sem limite de cima (`> 0.7.0`) |
+| na correção da própria linha ou acima dela, mas dentro de uma faixa com limite de cima (`<`, `<=` ou `=`) | **erro** (exit 2): o aviso se contradiz |
 | dentro da faixa, sem nenhuma correção publicada | **afetada** (exit 1) |
 | dentro da faixa, com correções só para outras linhas | **não resolvida** (exit 2): o aviso não diz se a linha está corrigida |
 | fora da faixa e sem correção para a própria linha | limpa |
@@ -219,6 +220,7 @@ Uma exceção fica no repositório que consome o workflow, em `advisory-exceptio
   "exceptions": [
     {
       "advisory": "GHSA-465w-v9q3-7j98",
+      "kind": "UNRESOLVED",
       "crate": "quinn-proto",
       "version": "0.12.0",
       "reason": "Explica por que a versão não é afetada, com a fonte (commit, release notes).",
@@ -228,16 +230,16 @@ Uma exceção fica no repositório que consome o workflow, em `advisory-exceptio
 }
 ```
 
-- Cada exceção vale para um GHSA, um crate e **uma versão exata**: atualizar o crate exige revisar a exceção de novo.
-- Sem `crate` e `version`, a exceção vale para um achado do aviso inteiro (aviso sem pacote Rust utilizável, por exemplo). Os dois campos vêm juntos ou nenhum.
-- `reason` é obrigatório. `review-by` é uma data `AAAA-MM-DD`: depois dela, a exceção vence e o check falha até alguém revisar.
-- Exceção que não casa com nenhum achado falha, como o `unused-ignored-advisory` do `deny.toml`. Exceção duplicada, chave desconhecida ou arquivo fora do formato também falham.
+- Cada exceção vale para um GHSA, um tipo de achado (`kind`: `AFFECTED`, `UNRESOLVED` ou `ERROR`), um crate e **uma versão exata**. Atualizar o crate, ou o achado mudar de tipo (por exemplo, de `UNRESOLVED` para `AFFECTED` porque o aviso ganhou uma correção para a linha), deixa a exceção sem uso, e o check falha até alguém revisar.
+- Sem `crate` e `version`, a exceção vale só para o erro do aviso inteiro (`kind: "ERROR"`, aviso sem pacote Rust utilizável). Ela nunca cobre as entradas Rust do mesmo aviso, que continuam sendo avaliadas. Os dois campos vêm juntos ou nenhum.
+- `reason` é obrigatório. `review-by` é uma data `AAAA-MM-DD` no máximo 90 dias à frente do dia da execução (decisão do Denilson); data mais distante falha. Depois dela, a exceção vence e o check falha até alguém revisar.
+- Exceção que não casa com nenhum achado falha, como o `unused-ignored-advisory` do `deny.toml`. Exceção que casa com mais de um achado também falha, e não aceita nenhum deles. Exceção duplicada, chave desconhecida ou arquivo fora do formato também falham.
 - Achado coberto por exceção aparece como aviso no log, com o motivo e a data de revisão.
 - Falha da API, resposta curta e erro no próprio arquivo de exceções não têm exceção.
 
 #### Testes
 
-[`tools/repo-advisories/test.sh`](tools/repo-advisories/test.sh) roda o script contra uma API falsa (`python3 -m http.server`) com 40 casos: cada regra acima, as formas recusadas, as exceções e as falhas da API. O job `advisory-tests` do `ci.yml` deste repositório roda os testes em todo PR daqui; ele não existe nos callers.
+[`tools/repo-advisories/test.sh`](tools/repo-advisories/test.sh) roda o script contra uma API falsa (`python3 -m http.server`) com 49 casos: cada regra acima, as formas recusadas, as exceções e as falhas da API. O job `advisory-tests` do `ci.yml` deste repositório roda os testes em todo PR daqui; ele não existe nos callers.
 
 Para testar contra a API real: `GH_TOKEN=$(gh auth token) tools/repo-advisories/check.sh --lock caminho/Cargo.lock --repo quinn-rs/quinn --min-advisories 13 --exceptions caminho/advisory-exceptions.json quinn quinn-proto quinn-udp`.
 

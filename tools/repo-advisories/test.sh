@@ -17,7 +17,10 @@ for _ in $(seq 50); do
   curl -s -o /dev/null "http://127.0.0.1:$PORT/" && break
   sleep 0.1
 done
-FUT=$(date -u -d '+30 days' +%F); PAST=$(date -u -d '-1 day' +%F)
+FUT=$(date -u -d '+30 days' +%F)
+PAST=$(date -u -d '-1 day' +%F)
+MAX=$(date -u -d '+90 days' +%F)
+TOOFAR=$(date -u -d '+91 days' +%F)
 adv() { # id range patched [ecosystem] [crate]
   jq -nc --arg id "$1" --arg r "$2" --arg p "$3" --arg e "${4-rust}" --arg c "${5-quinn-proto}" \
     '{ghsa_id:$id,severity:"high",summary:"s",html_url:"u",withdrawn_at:null,
@@ -37,7 +40,7 @@ check() { # name lock advisories-json-array exceptions expected-exit substring [
 }
 A465=$(adv GHSA-465w-v9q3-7j98 '> 0.7.0' '>= 0.11.18')
 EX() { echo "{\"exceptions\":[$1]}"; }
-E465="{\"advisory\":\"GHSA-465w-v9q3-7j98\",\"crate\":\"quinn-proto\",\"version\":\"0.12.0\",\"reason\":\"quinn 0.12 rewrote the code path; checked upstream\",\"review-by\":\"$FUT\"}"
+E465="{\"advisory\":\"GHSA-465w-v9q3-7j98\",\"kind\":\"UNRESOLVED\",\"crate\":\"quinn-proto\",\"version\":\"0.12.0\",\"reason\":\"quinn 0.12 rewrote the code path; checked upstream\",\"review-by\":\"$FUT\"}"
 
 # 1. Below the fix of its own line, outside the range (GHSA-q8wc).
 check q8wc-0.10.3 "quinn-proto=0.10.3" "[$(adv GHSA-q8wc-j5m9-27w3 '< 0.9.5' '0.9.5, 0.10.5')]" "" 1 "below the fix 0.10.5"
@@ -53,11 +56,21 @@ check exc-other-version "quinn-proto=0.12.1" "[$A465]" "$(EX "$E465")" 2 "Unused
 check exc-no-reason "quinn-proto=0.12.0" "[$A465]" "$(EX "${E465/quinn 0.12 rewrote the code path; checked upstream/}")" 2 "needs a \"reason\""
 check exc-bad-date "quinn-proto=0.12.0" "[$A465]" "$(EX "${E465/$FUT/2026-02-30}")" 2 "valid YYYY-MM-DD"
 check exc-dup "quinn-proto=0.12.0" "[$A465]" "$(EX "$E465,$E465")" 2 "Duplicate exception"
-check exc-half "quinn-proto=0.12.0" "[$A465]" "$(EX "{\"advisory\":\"GHSA-465w-v9q3-7j98\",\"crate\":\"quinn-proto\",\"reason\":\"some long reason\",\"review-by\":\"$FUT\"}")" 2 "both \"crate\" and \"version\""
+check exc-half "quinn-proto=0.12.0" "[$A465]" "$(EX "{\"advisory\":\"GHSA-465w-v9q3-7j98\",\"kind\":\"UNRESOLVED\",\"crate\":\"quinn-proto\",\"reason\":\"some long reason\",\"review-by\":\"$FUT\"}")" 2 "both \"crate\" and \"version\""
 check exc-extra-key "quinn-proto=0.12.0" "[$A465]" "$(EX "${E465%\}},\"ranges\":\"*\"}")" 2 "unknown keys"
 check exc-bad-file "quinn-proto=0.12.0" "[$A465]" "{\"exceptions\":[],\"x\":1}" 2 "nothing else"
+check exc-no-kind "quinn-proto=0.12.0" "[$A465]" "$(EX "${E465/\"kind\":\"UNRESOLVED\",/}")" 2 "needs \"kind\""
+check exc-kind-mismatch "quinn-proto=0.12.0" "[$A465]" "$(EX "${E465/UNRESOLVED/AFFECTED}")" 2 "no finding of that kind"
+check exc-90-days "quinn-proto=0.12.0" "[$A465]" "$(EX "${E465/$FUT/$MAX}")" 0 "accepted by the exception"
+check exc-91-days "quinn-proto=0.12.0" "[$A465]" "$(EX "${E465/$FUT/$TOOFAR}")" 2 "more than 90 days ahead"
+TWO='[{"ghsa_id":"GHSA-465w-v9q3-7j98","withdrawn_at":null,"vulnerabilities":[{"package":{"ecosystem":"rust","name":"quinn-proto"},"vulnerable_version_range":"> 0.7.0","patched_versions":">= 0.11.18"},{"package":{"ecosystem":"rust","name":"quinn-proto"},"vulnerable_version_range":">= 0.10.0","patched_versions":"0.11.18"}]}]'
+check exc-two-findings "quinn-proto=0.12.0" "$TWO" "$(EX "$E465")" 2 "matches 2 findings"
 check no-fix "quinn-proto=0.11.19" "[$(adv GHSA-2222-3333-4444 '>= 0.11.0' NULL)]" "" 1 "no fix published"
 check no-range "quinn-proto=0.11.19" "[$(adv GHSA-2222-3333-4444 NULL NULL)]" "" 1 "no fix published"
+# Contradictory data: at or above the fix of its line, inside a bounded range.
+check contradiction "quinn-proto=0.11.19" "[$(adv GHSA-2222-3333-4444 '<= 0.11.20' '0.11.18')]" "" 2 "contradictory advisory"
+check contradiction-or "quinn-udp=0.6.2" "[$(adv GHSA-2222-3333-4444 '< 0.5.16, >= 0.6.0 < 0.6.3' '>= 0.5.16, >= 0.6.1' rust quinn-udp)]" "" 2 "contradictory advisory"
+check open-qfwj "quinn-proto=0.11.19" "[$(adv GHSA-qfwj-vfxf-92j2 '>= 0.11.15' '0.11.17')]" "" 0 "No locked version"
 # 3. Pre-releases in ranges and fixes.
 check pre-range "quinn-proto=0.11.3" "[$(adv GHSA-2222-3333-4444 '0.11.0-0.11.6' '0.11.7')]" "" 2 "pre-release or build metadata"
 check pre-fix "quinn-proto=0.11.3" "[$(adv GHSA-2222-3333-4444 '< 0.11.7' '0.11.7-rc.1')]" "" 2 "pre-release or build metadata"
@@ -78,7 +91,9 @@ check eco-null "quinn-proto=0.11.19" '[{"ghsa_id":"GHSA-2222-3333-4444","withdra
 check eco-case "quinn-proto=0.11.19" "[$(adv GHSA-2222-3333-4444 '< 0.11.20' '0.11.20' Rust)]" "" 2 "not a Rust crate"
 check eco-npm "quinn-proto=0.11.19" "[$(adv GHSA-2222-3333-4444 '< 0.11.20' '0.11.20' npm)]" "" 2 "not a Rust crate"
 check eco-mixed "quinn-proto=0.11.19" '[{"ghsa_id":"GHSA-2222-3333-4444","withdrawn_at":null,"vulnerabilities":[{"package":{"ecosystem":"rust","name":"quinn-proto"},"vulnerable_version_range":"< 0.11.0","patched_versions":"0.11.0"},{"package":{"ecosystem":"pip","name":"aioquic"}}]}]' "" 2 "not a Rust crate"
-check exc-advisory-level "quinn-proto=0.11.19" "[$(adv GHSA-2222-3333-4444 '< 0.11.20' '0.11.20' npm)]" "$(EX "{\"advisory\":\"GHSA-2222-3333-4444\",\"reason\":\"npm binding only, not a Rust crate\",\"review-by\":\"$FUT\"}")" 0 "accepted by the exception"
+MIXED='[{"ghsa_id":"GHSA-2222-3333-4444","withdrawn_at":null,"vulnerabilities":[{"package":{"ecosystem":"rust","name":"quinn-proto"},"vulnerable_version_range":"< 0.11.20","patched_versions":"0.11.20"},{"package":{"ecosystem":"npm","name":"quinn"}}]}]'
+check exc-advisory-hides-rust "quinn-proto=0.11.19" "$MIXED" "$(EX "{\"advisory\":\"GHSA-2222-3333-4444\",\"kind\":\"ERROR\",\"reason\":\"npm binding only, not a Rust crate\",\"review-by\":\"$FUT\"}")" 1 "below the fix 0.11.20"
+check exc-advisory-level "quinn-proto=0.11.19" "[$(adv GHSA-2222-3333-4444 '< 0.11.20' '0.11.20' npm)]" "$(EX "{\"advisory\":\"GHSA-2222-3333-4444\",\"kind\":\"ERROR\",\"reason\":\"npm binding only, not a Rust crate\",\"review-by\":\"$FUT\"}")" 0 "accepted by the exception"
 check min-count "quinn-proto=0.11.19" "[$A465]" "" 2 "fewer than the 13 known" 13
 check withdrawn "quinn-proto=0.11.3" '[{"ghsa_id":"GHSA-2222-3333-4444","withdrawn_at":"2026-01-01T00:00:00Z","vulnerabilities":[]}]' "" 0 "No locked version"
 check api-404 "quinn-proto=0.11.3" "" "" 2 "HTTP 404"
