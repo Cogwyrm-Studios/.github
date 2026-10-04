@@ -164,6 +164,12 @@ jobs:
             # Supply chain policy: cargo-deny (licenses, bans, sources and
             # ignored advisories) and the exceptions of the advisory step.
             deny.toml advisory-exceptions.json
+            # Claude Code project settings and hooks: hooks run on every
+            # session of every machine that pulls the repository. A .claude
+            # or .claude/hooks that is a symlink shows up as a single file.
+            '.claude/settings.json' '*/.claude/settings.json'
+            '.claude/hooks/*' '*/.claude/hooks/*' '.claude/hooks' '*/.claude/hooks'
+            .claude
             # Authentication.
             'auth/*' '*/auth/*' 'oauth/*' '*/oauth/*'
             'authentication/*' '*/authentication/*' 'login/*' '*/login/*'

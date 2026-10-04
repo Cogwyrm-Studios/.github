@@ -73,6 +73,7 @@ Caminhos protegidos por padrão:
 - **CI e regras de varredura:** tudo em `.github/` (inclusive os workflows, para que um PR não troque o próprio portão), `.gitleaks.toml` e `.gitleaksignore`.
 - **Cifragem de segredos:** `.sops.yaml`.
 - **Política da cadeia de suprimentos:** `deny.toml` (licenças, crates banidas, origens e avisos ignorados do `cargo-deny`) e `advisory-exceptions.json` (exceções do passo dos avisos do quinn).
+- **Claude Code:** `.claude/settings.json` e tudo em `.claude/hooks/`, na raiz ou em qualquer pasta (inclusive `.claude` ou `.claude/hooks` trocados por link simbólico). Os hooks rodam em toda sessão de toda máquina que puxa o repositório, e o `settings.json` define hooks, permissões e plugins.
 - **Autenticação:** pastas `auth/`, `oauth/`, `authentication/` e `login/`, e arquivos `auth.*`, `auth_*`, `*_auth.*` e `oauth*`.
 - **Pagamentos:** pastas `payment/`, `payments/`, `billing/`, `purchase/` e `purchases/`, e arquivos `payment*`, `*_payment*` e `billing*`.
 
