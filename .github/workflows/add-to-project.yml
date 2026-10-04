@@ -1,0 +1,79 @@
+# Reusable workflow that adds the issue or pull request of the triggering
+# event to an organization project (see README.md).
+#
+# Callers trigger it on `issues` and `pull_request_target`. With
+# `pull_request_target` it runs with secrets even for pull requests from
+# forks, so it must never check out or run code from the pull request: it
+# only reads the node ID from the event payload and calls the GraphQL API.
+name: add-to-project
+
+on:
+  workflow_call:
+    inputs:
+      app-id:
+        description: ID of the GitHub App that writes to the project (vars.AGENTS_APP_ID).
+        type: string
+        required: true
+      project-number:
+        description: Number of the organization project.
+        type: number
+        default: 1
+    secrets:
+      app-private-key:
+        description: Private key of the GitHub App (secrets.AGENTS_APP_PRIVATE_KEY).
+        required: true
+
+# The job uses only the GitHub App token, never the GITHUB_TOKEN.
+permissions: {}
+
+jobs:
+  add:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      # Token scoped to the current repository plus the organization
+      # projects, with only the permissions this job needs.
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ inputs.app-id }}
+          private-key: ${{ secrets.app-private-key }}
+          permission-organization-projects: write
+          permission-issues: read
+          permission-pull-requests: read
+
+      # Payload values go through env, never interpolated into the script.
+      # Adding an item that is already in the project is a no-op.
+      - name: Add item to project
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          OWNER: ${{ github.repository_owner }}
+          PROJECT_NUMBER: ${{ inputs.project-number }}
+          CONTENT_ID: ${{ github.event.issue.node_id || github.event.pull_request.node_id }}
+          PROJECT_QUERY: >-
+            query($owner: String!, $number: Int!) {
+            organization(login: $owner) { projectV2(number: $number) { id } } }
+          ADD_MUTATION: >-
+            mutation($project: ID!, $content: ID!) {
+            addProjectV2ItemById(input: {projectId: $project, contentId: $content}) { item { id } } }
+        run: |
+          set -euo pipefail
+          if [ -z "$CONTENT_ID" ]; then
+            echo "::error::The event has no issue or pull request."
+            exit 1
+          fi
+          project_id="$(gh api graphql \
+            -f query="$PROJECT_QUERY" \
+            -f owner="$OWNER" -F number="$PROJECT_NUMBER" \
+            --jq '.data.organization.projectV2.id')"
+          if [ -z "$project_id" ] || [ "$project_id" = "null" ]; then
+            echo "::error::Project $PROJECT_NUMBER of $OWNER not found or not readable by the GitHub App."
+            exit 1
+          fi
+          item_id="$(gh api graphql \
+            -f query="$ADD_MUTATION" \
+            -f project="$project_id" -f content="$CONTENT_ID" \
+            --jq '.data.addProjectV2ItemById.item.id')"
+          echo "Added $CONTENT_ID to project $PROJECT_NUMBER as item $item_id."
