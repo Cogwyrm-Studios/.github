@@ -396,23 +396,32 @@ jobs:
           head_sha="$(jq -r '.head.sha' "$work/pr.json")"
           merge_base=""
 
-          # Line ranges ("first last ...") of the frontmatter and of the ```!
-          # blocks of a Markdown file. An unclosed one runs to the end.
+          # Line ranges ("first last ...") that a change must not touch in a
+          # Markdown file. The frontmatter runs from line 1 (when the first
+          # non-blank line is ---) to the first line that is exactly ---, or
+          # to the end. Claude Code runs a ```! block wherever it starts in a
+          # line and an inline !`command` across lines, so a file with a ```!
+          # (or ~~~!) anywhere, or with a !` not closed on its line, is one
+          # range from the first line to the last.
           # shellcheck disable=SC2016 # awk program, not shell
           ranges_awk='
             { sub(/\r$/, "") }
-            NR == 1 { sub(/^\357\273\277/, ""); if ($0 ~ /^---[ \t]*$/) { fm = 1; next } }
-            fm == 1 { if ($0 ~ /^---[ \t]*$/) { printf "1 %d ", NR; fm = 2 }; next }
-            fence == "" && $0 ~ /^[ \t]*(```+|~~~+)!/ {
-              match($0, /[`~]+/); fence = substr($0, RSTART, RLENGTH); start = NR; next
+            NR == 1 { sub(/^\357\273\277/, "") }
+            fm == 0 && $0 !~ /^[ \t]*$/ {
+              if ($0 ~ /^---[ \t]*$/) { fm = 1; next }
+              fm = -1
             }
-            fence != "" && $0 ~ /^[ \t]*(`+|~+)[ \t]*$/ {
-              match($0, /[`~]+/); m = substr($0, RSTART, RLENGTH)
-              if (substr(m, 1, 1) == substr(fence, 1, 1) && length(m) >= length(fence)) {
-                printf "%d %d ", start, NR; fence = ""
+            fm == 1 && $0 == "---" { printf "1 %d ", NR; fm = 2 }
+            index($0, "```!") || index($0, "~~~!") { whole = 1 }
+            {
+              rest = $0
+              while ((i = index(rest, "!`")) > 0) {
+                rest = substr(rest, i + 2)
+                if (index(rest, "`") == 0) { whole = 1; break }
+                rest = substr(rest, index(rest, "`") + 1)
               }
             }
-            END { if (fm == 1) printf "1 %d ", NR; if (fence != "") printf "%d %d ", start, NR }'
+            END { if (fm == 1) printf "1 %d ", NR; if (whole) printf "1 %d ", NR }'
           # Succeeds when an added line falls inside a range of "new" or a
           # removed line inside a range of "old".
           # shellcheck disable=SC2016 # awk program, not shell
@@ -489,8 +498,9 @@ jobs:
             # accepts hooks, mcpServers, permissionMode and allowed-tools,
             # and the body runs !`command` and ```! blocks. The file is
             # protected when an added or removed line falls inside the
-            # frontmatter or a ```! block (of the file before or after the
-            # change), or anywhere has one of those keys, an inline command,
+            # frontmatter, or anywhere in a file that has a ```! or an
+            # unclosed !` (before or after the change), or anywhere has one
+            # of those keys, an inline command, a ```!,
             # a YAML hex escape, an explicit key ("? ") or an anchor or alias.
             # A rename or copy protects the file, because the diff does not
             # show the frontmatter that moved. Without a diff (too large or
@@ -512,7 +522,7 @@ jobs:
                   patch="$(jq -r '.patch' <<< "$entry")"
                   if grep -qiE \
                     -e "^[+-](.*[^[:alnum:]_-])?[\"']?(hooks|mcpServers|permissionMode|allowed-?tools)[\"']?[[:space:]]*:" \
-                    -e '^[+-](.*[[:space:]])?!`' -e '^[+-][[:space:]]*(```|~~~)!' \
+                    -e '^[+-](.*[[:space:]])?!`' -e '^[+-].*(```|~~~)!' \
                     -e '^[+-].*\\[xu][[:xdigit:]]{2}' -e '^[+-][[:space:]]*\?([[:space:]]|$)' \
                     -e '^[+-](.*[[:space:]])?&[[:alnum:]_.-]+([[:space:]]|$)' \
                     -e '^[+-][[:space:]]*(-[[:space:]]+)?\*[^[:space:]]+[[:space:]]+:' \
@@ -529,7 +539,7 @@ jobs:
                     if { [ "$status" = added ] || old_ranges="$(ranges_at "$merge_base" "$path")"; } \
                       && { [ "$status" = removed ] || new_ranges="$(ranges_at "$head_sha" "$path")"; }; then
                       if awk -v old="$old_ranges" -v new="$new_ranges" "$hunks_awk" <<< "$patch"; then
-                        matched="$path (Claude Code frontmatter or \`\`\`! block changed)"
+                        matched="$path (Claude Code frontmatter or file with commands changed)"
                       fi
                     else
                       matched="$path (Claude Code instructions could not be read)"
